@@ -4,7 +4,7 @@
 
 | # | Step | Command / effect | Working dir |
 | --- | --- | --- | --- |
-| 1 | load generation + measurement | `python -u -m fmperf.loadgen.run` (writes `RESULTS_DIR/results.json`) | repo root |
+| 1 | load generation + measurement | `python -u -m fmperf.loadgen.run` (writes `RESULTS_DIR/results.json`; routes every request to a mix profile and tags it with `workload_profile` when `ADDITIVE=TRUE`) | repo root |
 | 2 | `cd` | `os.makedirs(RESULTS_DIR)` + `os.chdir(RESULTS_DIR)` | `RESULTS_DIR` |
 | 3 | convert | `python -u requests/convert_to_csv.py` → `output.csv` (per request: completion time, success, success_rate) | `RESULTS_DIR` |
 | 4 | early metrics gate | `python -u requests/analyze_metrics.py .`; the automation scrapes `Median responded requests per minute:` and, for non-MIT runs, fails the iteration when it is `< 0.95 * REQ_MIN` | `RESULTS_DIR` |
@@ -42,6 +42,9 @@ Never reuse exit code `1` for a different meaning in that script.
   missing, `requests/store_results.py::_extract_median_tokens_from_log` recovers it from the Slurm
   log with `Median tokens per response:\s*([0-9]+(?:\.[0-9]+)?)`. Keep the prefix and a plain,
   unformatted number.
+- `requests/store_results.py` prints `Additive expected proportions: <json>` and
+  `Additive true proportions: <json>` for additive rows (`{}` when unknown); they mirror the
+  `ADDITIVE_*_PROPORTIONS` columns so the achieved mix is visible in the Slurm log.
 - `requests/evaluate.py` also prints the `no_statistical_difference_overall` summary used when
   reading logs by hand; keep those lines meaningful.
 
@@ -58,17 +61,22 @@ Never reuse exit code `1` for a different meaning in that script.
 - `set_process_env_for_run` derives `REQUESTS_FILENAME` by appending the input interval
   (`sample_requests_<in_min>-<in_max>.json`) and caches the unsuffixed base in
   `REQUESTS_FILENAME_BASE`, so repeated calls do not stack suffixes.
-- Who reads what: `experiment_automation.load_env_config()` handles `TOKENS_LIST`, `REQ_MIN_START`,
+- Who reads what: `experiment_automation.load_env_config()` handles `TOKENS_LIST`, `WORKLOAD_MIXES`,
+  `REQ_MIN_START`,
   `REQ_MIN_INCREASE_MULTIPLIER`, `STOP_THRESHOLD`, `EXPERIMENT_TYPE`, `DURATION`,
   `ITERATION_COOLDOWN_SECONDS`, `ITERATION_HARD_LIMIT`, `SERVICE_TYPE`, `USE_CASES_YAML`;
   `fmperf/loadgen/run.py` reads `TARGET`, `URL`, `MODEL_DISCOVERY_TIMEOUT`, `REQ_MIN`, `DURATION`,
   `BACKOFF`, `GRACE_PERIOD`, `REQUEST_TIMEOUT`, `TTFT_TIMEOUT`, `TPOT_TIMEOUT`,
-  `WORKER_RPM_CAPACITY`, `MAX_WORKERS`; `fmperf/loadgen/generate-input.py` reads `PROMPTS_FILE`
+  `WORKER_RPM_CAPACITY`, `MAX_WORKERS`, plus `ADDITIVE` and `WORKLOAD_MIX_SPEC` on additive runs;
+  `fmperf/loadgen/generate-input.py` reads `PROMPTS_FILE`
   (only there — the automation hardcodes `oasst_roots_en_max1000_tokens.jsonl`),
   `FRAC_GREEDY`, `SAMPLE_SIZE`, `TARGET`, `URL`, `MODEL`; `requests/split_results.py` reads
   `FILTER_BUFFER`; `SUCCESS_RATE_THRESHOLD` is read by the automation and by `evaluate.py`.
   `THRESHOLD_TYPE`, `SUCCESS_RATE`, `RESULTS_ALL_FILENAME`, `CODE`, `NUM_USERS`, `SWEEP_USERS` are
   documented or used only by upstream fmperf paths, not by this pipeline.
+- `requests/store_results.py` reads everything from `os.environ` plus argv, so the additive markers
+  (`ADDITIVE`, `WORKLOAD_MIX`, `WORKLOAD_MIX_SPEC`) must already be exported when it is spawned; they
+  travel in the environment on purpose (see the argv contract below).
 - `EXPERIMENT_TYPE` must be passed to `store_results.py` through the child environment: the
   automation exports the resolved value (`os.environ['EXPERIMENT_TYPE'] = get_experiment_type()`)
   before spawning it, because `store_results.py` reads `os.environ` and never argv.
@@ -81,9 +89,9 @@ Indices below are `sys.argv[1:]` inside `requests/store_results.py`, compact for
 | --- | --- | --- |
 | 0 | model | model used for the iteration (`MODEL`) |
 | 1 | stage | `1` or `2` |
-| 2 | parent_dir | `<in>-<in>_<out>-<out>` — this is the format-detection key |
-| 3 | in_range | `MIN-MAX` input tokens |
-| 4 | out_range | `MIN-MAX` output tokens |
+| 2 | parent_dir | `<in>-<in>_<out>-<out>`, or `mix_...` for an additive `WORKLOAD_MIXES` run — this is the format-detection key |
+| 3 | in_range | `MIN-MAX` input tokens (on additive runs: the mix envelope, kept only for the layout detection; the persisted column is blank) |
+| 4 | out_range | `MIN-MAX` output tokens (on additive runs: the mix envelope, ditto) |
 | 5 | req_min | REQ_MIN of the iteration (largest TRUE on a stage-2 hard-limit stop) |
 | 6 | evaluation | `TRUE` / `FALSE` |
 | 7 | median | median response tokens (may be empty) |
@@ -140,3 +148,15 @@ Fragilities to respect:
 - One row per iteration; the final row of a token experiment is the one with `FINISHED=TRUE` and
   carries any `TERMINATION_REASON` / `BINARY_SEARCH_*` / `LARGEST_TRUE` / `SMALLEST_FALSE`
   information. `REQ_MIN` in that row is the answer (largest TRUE when a hard limit stopped stage 2).
+- Additive (`WORKLOAD_MIXES`) rows: `WORKLOAD_MIX` carries the canonical mix and the
+  `ADDITIVE_EXPECTED_PROPORTIONS` / `ADDITIVE_TRUE_PROPORTIONS` columns carry the normalised alphas
+  and the observed share of each profile (all requests, failures included). The four
+  `MIN/MAX_INPUT/OUTPUT_TOKENS` columns stay empty by design: the mix envelope is passed in argv
+  only so `_compact_layout_signature` keeps detecting the compact layout, and the `.env` backfill is
+  skipped for those columns. `REQ_MIN` / `EVALUATION` / `STAGE` / `FINISHED` keep their usual
+  meaning, and `RESPONSES_WITHIN/OUTSIDE_EXPECTED_INTERVAL` are computed per profile and only over
+  requests that produced tokens (a failed request has no output length to classify).
+- Additive per-profile data travels in `WORKLOAD_MIX_SPEC` (environment, never argv). A missing or
+  unusable spec degrades to empty additive columns with a `Warning:` instead of failing the store
+  step, and `requests/store_results.py` resolves the per-profile requests files (prompts.csv, median
+  prompt tokens, input tokens) through that spec.

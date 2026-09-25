@@ -38,9 +38,8 @@ General:
 
 - Use `pathlib` and avoid POSIX-only semantics in Python: the code is written on Windows and run on
   Linux.
-- For new subprocesses use `sys.executable` plus an argument list. The existing `shell=True` string
-  commands and the single `python -u generate_requests.py` call (the only step that does not use
-  `sys.executable`) are legacy — do not extend that pattern, and fix it when you touch that code.
+- For new subprocesses use `sys.executable` plus an argument list (the remaining `shell=True` string
+  commands are legacy — do not extend that pattern, and fix them when you touch that code).
 - Keep each file's existing language: some `evaluate.py` docstrings are Spanish, the rest is
   English. Do not mass-translate.
 - No logging framework — the Slurm log is the interface, so keep stdout lines stable (see 02).

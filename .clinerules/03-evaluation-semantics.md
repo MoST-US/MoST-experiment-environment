@@ -43,6 +43,30 @@ and differ only in how an iteration's verdict is computed.
 3. TRUE (exit 0) when there is no statistical difference **or** the first half has the higher
    response time (i.e. the second half is not degrading).
 
+## Additive `WORKLOAD_MIXES` experiments
+
+An additive experiment evaluates a mix of token profiles at once. It uses the **same stage machine,
+thresholds and verdicts** as a regular experiment; only the workload and the reported columns change.
+
+- One experiment per bracketed `WORKLOAD_MIXES` entry, sequentially; `parent_dir` is the canonical
+  mix (`mix_<in>_<out>@<alpha>+...`), the archive is `Experiment_MIX_<EXPERIMENT_TYPE>_<timestamp>`
+  and `REQ_MIN_START[idx]` seeds the idx-th mix. `TOKENS_LIST` is ignored in this mode.
+- Every request draws its profile with probability `alpha` (weighted choice in the loadgen), takes a
+  prompt from that profile's own requests file and draws its output length from that profile's
+  `[out_min, out_max]`. A profile file is generated once per input interval with the union of the
+  output intervals of every configured profile for that input interval, so a shared file stays
+  usable; the served length is always the profile's own interval.
+- `MIN/MAX_INPUT/OUTPUT_TOKENS` are empty in the persisted row (the envelope is an internal detail);
+  `WORKLOAD_MIX` identifies the experiment and `ADDITIVE=TRUE` marks the row.
+- Mix fidelity: `ADDITIVE_EXPECTED_PROPORTIONS` (normalised alphas) vs `ADDITIVE_TRUE_PROPORTIONS`
+  (observed share of all requests, failures included); both are printed to stdout.
+- Interval compliance is per profile and only over requests that produced tokens; requests without
+  tokens are reported as excluded and counted by `SUCCESS_RATE` instead, so a partially failing mix
+  is not reported as an interval violation.
+- The success-rate gate, the stage-1 `0.95 * REQ_MIN` early gate, the MIT plateau checks and the
+  MST t-test/TOST are untouched: never relax them for a mix, and never let a mix verdict bypass the
+  double-FALSE confirmation.
+
 ## Rules
 
 - Apply any verdict override **before** the persistence block: `_confirmed_bounds()` is read after

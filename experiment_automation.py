@@ -13,6 +13,7 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from fmperf.utils.constants import REQUESTS_DIR, REQUESTS_FILENAME, RESULTS_FILENAME, RESULTS_DIR
+from workload_mix import mix_spec_payload, output_bounds_for_input, parse_workload_mixes
 
 REQUESTS_PROMPTS_FILE = Path("oasst_roots_en_max1000_tokens.jsonl")
 
@@ -20,6 +21,10 @@ REQUESTS_PROMPTS_FILE = Path("oasst_roots_en_max1000_tokens.jsonl")
 # They are moved into results/<EXPERIMENT_TYPE>_<timestamp> when the automation
 # finishes (see _archive_execution_results).
 CREATED_RESULT_DIRS: list[str] = []
+
+# True while an additive (WORKLOAD_MIXES) execution is running: the archive folder of such a run
+# is named Experiment_MIX_<EXPERIMENT_TYPE>_<timestamp> instead of Experiment_<EXPERIMENT_TYPE>_...
+ADDITIVE_RUN_ACTIVE = False
 
 #
 # Configuration loader: read values from .env without modifying the file.
@@ -85,6 +90,8 @@ def _parse_int_list(value):
         except ValueError:
             # skip malformed entries
             continue
+    return items
+
 def load_use_cases_from_yaml(yaml_path):
     import yaml
     if not yaml_path:
@@ -135,6 +142,8 @@ def load_env_config():
 
     Expected keys:
     - TOKENS_LIST: comma-separated pairs like "32:32,32:64"
+    - WORKLOAD_MIXES: additive experiments, e.g. "[(1-100:1-100,0.5),(300-600:100-300,0.5)]"
+      (see workload_mix.py); it replaces TOKENS_LIST for additive runs
     - REQ_MIN_START: comma-separated integers (per-token-combo initial REQ_MIN)
     - REQ_MIN_INCREASE_MULTIPLIER: integer (multiplier for stage 1 success)
         - STOP_THRESHOLD: float (relative stop threshold used as
@@ -152,6 +161,7 @@ def load_env_config():
         'ITERATION_HARD_LIMIT': 15,
         'SERVICE_TYPE': 'LLM',
         'USE_CASES_YAML': None,
+        'WORKLOAD_MIXES': [],
     }
 
     if env_path.exists():
@@ -165,6 +175,8 @@ def load_env_config():
                 val = val.strip()
                 if key == 'TOKENS_LIST':
                     config['TOKENS_LIST'] = _parse_tokens_list(val)
+                elif key == 'WORKLOAD_MIXES':
+                    config['WORKLOAD_MIXES'] = parse_workload_mixes(val)
                 elif key == 'SERVICE_TYPE':
                     config['SERVICE_TYPE'] = val.strip()
                 elif key == 'USE_CASES_YAML':
@@ -586,6 +598,45 @@ def _get_requests_filename_base():
     os.environ['REQUESTS_FILENAME_BASE'] = normalized
     return normalized
 
+def _mix_requests_filename(in_min, in_max):
+    """Requests file of a workload profile: <base>_<in_min>-<in_max>.json.
+
+    Mirrors the suffix that set_process_env_for_run appends to REQUESTS_FILENAME, so a profile
+    reads exactly the file the harness would select for that input interval. Profiles sharing an
+    input interval therefore share the file, even when their output intervals differ.
+    """
+    base_filename = _get_requests_filename_base()
+    name, ext = os.path.splitext(base_filename)
+    if not ext:
+        ext = '.json'
+    return f"{name}_{in_min}-{in_max}{ext}"
+
+
+_WORKLOAD_MIXES_CACHE = None
+
+
+def _get_workload_mixes():
+    """Resolve the configured WORKLOAD_MIXES (env first, then .env).
+
+    Parsed once per process so the tolerant parser warnings are printed a single time and every
+    caller (the mix loop and the requests-file generation) sees the same mixes.
+    """
+    global _WORKLOAD_MIXES_CACHE
+    if _WORKLOAD_MIXES_CACHE is None:
+        env_val = os.environ.get('WORKLOAD_MIXES')
+        if env_val is not None and str(env_val).strip():
+            _WORKLOAD_MIXES_CACHE = parse_workload_mixes(env_val)
+        else:
+            _WORKLOAD_MIXES_CACHE = CONFIG.get('WORKLOAD_MIXES', []) or []
+    return _WORKLOAD_MIXES_CACHE
+
+
+def _set_additive_run_active(value):
+    """Mark the process as running an additive (WORKLOAD_MIXES) execution."""
+    global ADDITIVE_RUN_ACTIVE
+    ADDITIVE_RUN_ACTIVE = bool(value)
+
+
 def set_process_env_for_run(req_min_value, input_interval=None, output_interval=None):
     """Set environment variables in-process for a run without modifying .env.
 
@@ -831,11 +882,16 @@ def update_stage_2(evaluation, current_req_min, M, m, retry_count_stage2):
     new_req_min = (M + m) / 2
     return new_req_min, M, m, retry_count_stage2
 
-def run_experiment_for_tokens(tokens, initial_req_min=None):
+def run_experiment_for_tokens(tokens, initial_req_min=None, workload_mix=None):
     """Run the complete experiment for a specific token combination.
 
     initial_req_min: optional initial value for REQ_MIN specific to this
     token combination. If None, defaults to 1.
+
+    workload_mix: optional mix dict from workload_mix.parse_workload_mixes. When given this is an
+    additive experiment: `tokens` is then only the mix envelope (kept for the store_results.py
+    layout detection), the parent folder is named after the mix, and every request is routed to
+    one of the mix profiles by the loadgen (see WORKLOAD_MIX_SPEC).
     """
     # Get environment variables at the start and store them as Python variables
     model = os.environ.get('MODEL', '')
@@ -880,7 +936,31 @@ def run_experiment_for_tokens(tokens, initial_req_min=None):
     
     # Create parent directory for this token pair
     # tokens can be [in_min,in_max,out_min,out_max] or [in,out]
-    if os.environ.get('SERVICE_TYPE') == 'SaaS':
+    additive = workload_mix is not None
+    if additive:
+        # Additive run (WORKLOAD_MIXES): the parent folder is named after the mix, never after a
+        # single interval, and WORKLOAD_MIX identifies the experiment in results.csv. The token
+        # intervals below are the mix envelope and are only reported to store_results.py so its
+        # compact-layout detection keeps working; store_results.py blanks the four
+        # MIN/MAX_INPUT/OUTPUT_TOKENS columns when ADDITIVE is set. WORKLOAD_MIX_SPEC carries the
+        # per-profile routing rules (intervals, alphas, requests files) to the loadgen and to
+        # store_results.py, which uses it for the per-profile interval validation.
+        os.environ['ADDITIVE'] = 'TRUE'
+        os.environ['WORKLOAD_MIX'] = workload_mix['canonical']
+        os.environ['WORKLOAD_MIX_SPEC'] = mix_spec_payload(workload_mix, _mix_requests_filename)
+        parent_dir = workload_mix['parent_dir']
+        in_min = workload_mix['envelope']['in_min']
+        in_max = workload_mix['envelope']['in_max']
+        out_min = workload_mix['envelope']['out_min']
+        out_max = workload_mix['envelope']['out_max']
+        input_interval = (in_min, in_max)
+        output_interval = (out_min, out_max)
+        interval_strs = (f"{in_min}-{in_max}", f"{out_min}-{out_max}")
+        print(
+            f"Additive workload mix: {workload_mix['canonical']} "
+            f"(envelope {interval_strs[0]}:{interval_strs[1]}) -> parent folder {parent_dir}"
+        )
+    elif os.environ.get('SERVICE_TYPE') == 'SaaS':
         use_case_id = tokens[0]
         parent_dir = use_case_id
         input_interval = 'SaaS'
@@ -901,6 +981,14 @@ def run_experiment_for_tokens(tokens, initial_req_min=None):
         input_interval = tokens[0]
         output_interval = tokens[1]
         interval_strs = (str(tokens[0]), str(tokens[1]))
+
+    if not additive:
+        # Reset the additive markers explicitly: a non-additive experiment must never inherit the
+        # mix of a previous run in the same process, because the loadgen and store_results.py read
+        # them from the environment.
+        os.environ['ADDITIVE'] = 'FALSE'
+        os.environ['WORKLOAD_MIX'] = ''
+        os.environ['WORKLOAD_MIX_SPEC'] = ''
     
     # Track this execution's result folder so it can be archived at the end.
     if parent_dir and parent_dir not in CREATED_RESULT_DIRS:
@@ -938,6 +1026,44 @@ def run_experiment_for_tokens(tokens, initial_req_min=None):
         with open(req_path, 'w', encoding='utf-8') as f:
             json.dump([{"request": {}, "expected": []}], f)
         print(f"Bypassing generation; created dummy SaaS workload: {req_path}")
+    elif additive:
+        # Additive run: each profile reads its own requests file. Files are cached per input
+        # interval and generated with the union of the output intervals used by that input
+        # interval across every configured mix (a shared file has to be able to serve all of
+        # them); the length actually requested per request is chosen from the profile interval by
+        # the loadgen.
+        prompts_path = REQUESTS_PROMPTS_FILE.resolve()
+        if not prompts_path.exists():
+            raise FileNotFoundError(f"Prompts dataset missing: {prompts_path}")
+        for profile in workload_mix['profiles']:
+            req_path = Path(REQUESTS_DIR) / _mix_requests_filename(
+                profile['in_min'], profile['in_max']
+            )
+            if req_path.is_file():
+                print(f"Found existing workload: {req_path}. Using cached file.")
+                continue
+            gen_out_min, gen_out_max = output_bounds_for_input(
+                _get_workload_mixes(), profile['in_min'], profile['in_max']
+            )
+            print(
+                f"Not found workload: {req_path}. Generating new workload for input tokens "
+                f"{profile['in_min']}-{profile['in_max']} "
+                f"(output bounds {gen_out_min}-{gen_out_max})..."
+            )
+            command = (
+                f'"{sys.executable}" -u generate_requests.py '
+                f"{profile['in_min']} {profile['in_max']} "
+                f'--prompts-file "{prompts_path}" '
+                f'--output "{req_path}" '
+                f'--min-output {gen_out_min} --max-output {gen_out_max}'
+            )
+            run_command(command, wait=True)
+            if req_path.is_file():
+                print(f"Generated workload: {req_path}")
+            else:
+                raise FileNotFoundError(
+                    f"Workload generation failed; expected file not found: {req_path}"
+                )
     else:
         # Skip generation if interval-specific file already exists (uses REQUESTS_FILENAME with input suffix)
         req_filename = os.environ.get('REQUESTS_FILENAME', REQUESTS_FILENAME)
@@ -950,7 +1076,7 @@ def run_experiment_for_tokens(tokens, initial_req_min=None):
             if not prompts_path.exists():
                 raise FileNotFoundError(f"Prompts dataset missing: {prompts_path}")
             command = (
-                f'python -u generate_requests.py {in_min} {in_max} '
+                f'"{sys.executable}" -u generate_requests.py {in_min} {in_max} '
                 f'--prompts-file "{prompts_path}" '
                 f'--output "{req_path}"'
             )
@@ -1255,7 +1381,8 @@ def _archive_execution_results():
 
     The archive is created inside the results directory and named
     Experiment_[EXPERIMENT_TYPE]_[YYYY-MM-DD_HH-MM-SS], where the timestamp reflects when
-    the automation finished (i.e., when this function runs).
+    the automation finished (i.e., when this function runs). Additive executions
+    (WORKLOAD_MIXES) use Experiment_MIX_[EXPERIMENT_TYPE]_[YYYY-MM-DD_HH-MM-SS] instead.
     """
     if not CREATED_RESULT_DIRS:
         return
@@ -1269,7 +1396,8 @@ def _archive_execution_results():
 
     experiment_type = re.sub(r'[^0-9A-Za-z_-]', '_', get_experiment_type())
     finished_at = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    archive_dir = results_dir / f"Experiment_{experiment_type}_{finished_at}"
+    archive_prefix = 'Experiment_MIX' if ADDITIVE_RUN_ACTIVE else 'Experiment'
+    archive_dir = results_dir / f"{archive_prefix}_{experiment_type}_{finished_at}"
     archive_dir.mkdir(parents=True, exist_ok=True)
 
     moved = 0
@@ -1283,8 +1411,68 @@ def _archive_execution_results():
     print(f"Archived {moved} result folder(s) into {archive_dir}")
 
 
+def _run_additive_experiments(workload_mixes):
+    """Run one additive experiment per WORKLOAD_MIXES entry, sequentially.
+
+    Each mix is a full stage-1/stage-2 run whose requests are routed to the mix profiles by the
+    loadgen. `REQ_MIN_START[idx]` seeds the idx-th mix (the last value is reused when the list is
+    shorter), matching the TOKENS_LIST behaviour. TOKENS_LIST is not used in this mode.
+    """
+    _set_additive_run_active(True)
+    req_min_starts = CONFIG.get('REQ_MIN_START', [1])
+    results = {}
+    print(f"Found {len(workload_mixes)} additive workload mix(es) in WORKLOAD_MIXES.")
+    print("TOKENS_LIST is ignored for this execution.")
+
+    for idx, mix in enumerate(workload_mixes):
+        print(f"\n{'='*60}")
+        print(f"Starting additive experiment for WORKLOAD_MIX={mix['canonical']}")
+        print(f"{'='*60}")
+
+        # Pick initial REQ_MIN by index; if not enough values, use the last one
+        if req_min_starts:
+            initial_req_min = req_min_starts[idx] if idx < len(req_min_starts) else req_min_starts[-1]
+        else:
+            initial_req_min = 1
+
+        # The mix envelope is passed as the token interval so store_results.py keeps detecting its
+        # compact argv layout; the persisted MIN/MAX_*_TOKENS columns are blank for additive rows.
+        envelope = mix['envelope']
+        tokens = [envelope['in_min'], envelope['in_max'], envelope['out_min'], envelope['out_max']]
+        os.environ['SERVICE_TYPE'] = 'LLM'
+        result = run_experiment_for_tokens(tokens, initial_req_min, workload_mix=mix)
+        results[mix['canonical']] = result
+
+        if isinstance(result, dict) and result.get("aborted"):
+            print("Aborted remaining experiments after fatal pipeline error.")
+            break
+
+        print(f"\nCompleted additive experiment for WORKLOAD_MIX={mix['canonical']}")
+        print(f"Result: {result}")
+
+    print(f"\n{'='*60}")
+    print("ALL ADDITIVE EXPERIMENTS COMPLETED")
+    print(f"{'='*60}")
+    for mix_key, result in results.items():
+        print(f"WORKLOAD_MIX {mix_key}: {result}")
+
+    # Move this execution's results into their final archive folder (Experiment_MIX_*).
+    _archive_execution_results()
+    return results
+
+
 def main():
     service_type = CONFIG.get('SERVICE_TYPE', 'LLM')
+    workload_mixes = _get_workload_mixes()
+
+    if workload_mixes and service_type == 'SaaS':
+        print(
+            "Warning: WORKLOAD_MIXES is ignored in SaaS mode; the use cases of USE_CASES_YAML "
+            "are run instead."
+        )
+        workload_mixes = []
+    if workload_mixes:
+        return _run_additive_experiments(workload_mixes)
     
     if service_type == 'SaaS':
         yaml_path = CONFIG.get('USE_CASES_YAML')

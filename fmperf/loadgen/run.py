@@ -201,6 +201,88 @@ def run(result_filename=None):
             stopping["maxNewTokens"] = desired_tokens
         return payload, desired_tokens
 
+    def _load_additive_mix():
+        """Load the WORKLOAD_MIX_SPEC payload of an additive run (None when not additive).
+
+        MoST additive runs (WORKLOAD_MIXES) export one profile per (token interval, alpha) pair,
+        each one pointing at the requests file to sample prompts from. The payload is validated
+        here, before any request is sent, so a malformed mix fails fast instead of wasting a whole
+        iteration.
+        """
+        if os.environ.get("ADDITIVE", "").strip().upper() not in ("TRUE", "1", "YES"):
+            return None
+        raw = os.environ.get("WORKLOAD_MIX_SPEC", "").strip()
+        if not raw:
+            raise ValueError(
+                "ADDITIVE is enabled but WORKLOAD_MIX_SPEC is empty; the workload mix "
+                "specification is required to route every request to its profile."
+            )
+        try:
+            payload = json.loads(raw)
+        except Exception as exc:
+            raise ValueError(f"WORKLOAD_MIX_SPEC is not valid JSON: {exc}") from exc
+        raw_profiles = payload.get("profiles") if isinstance(payload, dict) else None
+        if not isinstance(raw_profiles, list) or not raw_profiles:
+            raise ValueError("WORKLOAD_MIX_SPEC must contain a non-empty 'profiles' list")
+        profiles = []
+        for raw_profile in raw_profiles:
+            filename = str(raw_profile.get("filename") or "").strip()
+            if not filename:
+                raise ValueError(f"WORKLOAD_MIX_SPEC profile without a requests file: {raw_profile}")
+            path = os.path.join(REQUESTS_DIR, filename)
+            if not os.path.isfile(path):
+                raise FileNotFoundError(f"Additive profile workload not found: {path}")
+            with open(path, "rb") as handle:
+                cases = json.load(handle)
+            if not isinstance(cases, list) or not cases:
+                raise ValueError(f"Additive profile workload is empty: {path}")
+            profile = {
+                "label": str(raw_profile.get("label") or filename),
+                "filename": filename,
+                "alpha": float(raw_profile.get("alpha", 0.0)),
+                "bounds": (
+                    int(raw_profile.get("out_min", 0)),
+                    int(raw_profile.get("out_max", 0)),
+                ),
+                "cases": cases,
+            }
+            profiles.append(profile)
+        total_alpha = sum(profile["alpha"] for profile in profiles)
+        if total_alpha <= 0:
+            raise ValueError("WORKLOAD_MIX_SPEC profiles must have positive alphas")
+        print(f">> Additive workload mix {payload.get('mix', '')}")
+        for profile in profiles:
+            print(
+                f"   profile {profile['label']} alpha={profile['alpha'] / total_alpha:.6g} "
+                f"output bounds {profile['bounds'][0]}-{profile['bounds'][1]} "
+                f"({len(profile['cases'])} prompts from {profile['filename']})"
+            )
+        return {"mix": payload.get("mix", ""), "profiles": profiles}
+
+    def _choose_profile(rs):
+        """Pick a workload profile at random, weighted by its alpha.
+
+        Additive runs only: the profiles (and their uses) live in `additive_profiles`, which is
+        loaded right before the workers start.
+        """
+        total = sum(profile["alpha"] for profile in additive_profiles)
+        draw = rs.uniform(0.0, total)
+        accumulated = 0.0
+        for profile in additive_profiles:
+            accumulated += profile["alpha"]
+            if draw <= accumulated:
+                return profile
+        return additive_profiles[-1]
+
+    def _with_profile(record, profile_label):
+        """Tag an event with the workload profile that served it (additive runs only).
+
+        Non-additive runs keep the historical results.json event schema untouched.
+        """
+        if profile_label:
+            record["workload_profile"] = profile_label
+        return record
+
     output_token_override = _get_output_token_override_bounds()
 
     infile = os.path.join(REQUESTS_DIR, REQUESTS_FILENAME)
@@ -272,8 +354,20 @@ def run(result_filename=None):
     ttft_timeout = float(os.environ.get("TTFT_TIMEOUT", "60"))  # 60 seconds default
     tpot_timeout = float(os.environ.get("TPOT_TIMEOUT", "30"))  # 30 seconds default
 
-    with open(infile, "rb") as f:
-        sample_requests = json.load(f)
+    additive_mix = _load_additive_mix()
+    additive_profiles = additive_mix["profiles"] if additive_mix else None
+    if additive_profiles:
+        # Additive run: every profile owns its requests file, so the mix-envelope file named by
+        # REQUESTS_FILENAME is neither read nor required here.
+        print(
+            ">> Additive runs tag every event with 'workload_profile' and draw the output length "
+            "from the profile interval; the 'consistent' flag stays informational because the "
+            "requests files are generated with the union of the mix output intervals."
+        )
+        sample_requests = []
+    else:
+        with open(infile, "rb") as f:
+            sample_requests = json.load(f)
 
     progress_lock = threading.Lock()
     scheduled_by_worker = {}
@@ -442,13 +536,27 @@ def run(result_filename=None):
             interval_base_ns = float('inf')
 
         def process_request(req_idx):
-            # Pick a sample request (thread-safe selection)
-            with rs_lock:
-                sample_idx = rs.randint(low=0, high=len(sample_requests))
-            template_request = sample_requests[sample_idx]["request"]
-            request_payload, _ = _build_request_payload(
-                template_request, target, rs, output_token_override, active_model
-            )
+            # Pick a sample request (thread-safe selection). Additive runs choose the workload
+            # profile first (weighted by alpha), then a random prompt inside that profile's own
+            # requests file, and draw the output length from the profile interval instead of the
+            # global MIN/MAX_OUTPUT_TOKENS override.
+            profile_label = None
+            if additive_profiles:
+                with rs_lock:
+                    profile = _choose_profile(rs)
+                    sample_idx = rs.randint(low=0, high=len(profile["cases"]))
+                template_request = profile["cases"][sample_idx]["request"]
+                request_payload, _ = _build_request_payload(
+                    template_request, target, rs, profile["bounds"], active_model
+                )
+                profile_label = profile["label"]
+            else:
+                with rs_lock:
+                    sample_idx = rs.randint(low=0, high=len(sample_requests))
+                template_request = sample_requests[sample_idx]["request"]
+                request_payload, _ = _build_request_payload(
+                    template_request, target, rs, output_token_override, active_model
+                )
 
             if target == "vllm":
                 headers = {"User-Agent": "fmaas-load-test"}
@@ -481,7 +589,7 @@ def run(result_filename=None):
                         "exp_num_users": exp_num_users,
                     }
                     with output_lock:
-                        output.append(record)
+                        output.append(_with_profile(record, profile_label))
                     time.sleep(backoff.to_seconds())
                     return True
             elif target == "tgis":
@@ -534,7 +642,7 @@ def run(result_filename=None):
                 }
 
                 with output_lock:
-                    output.append(record)
+                    output.append(_with_profile(record, profile_label))
                 response_idx += 1
                 t0 = t
 
@@ -640,10 +748,32 @@ def run(result_filename=None):
             tmp = json.load(f)
         all_outputs.extend(tmp)
 
+    def _case_for_row(row):
+        """Resolve the request case that produced a results row (None when unresolvable).
+
+        Additive events carry their profile label and their sample_idx indexes that profile's own
+        requests file; non-additive events keep indexing the single workload file. Resolving by
+        profile avoids matching a row against a prompt of another profile (or crashing on an
+        out-of-range index when the profile file is smaller than the mix-envelope one).
+        """
+        index = row.get("sample_idx")
+        if not isinstance(index, int):
+            return None
+        if additive_profiles:
+            label = row.get("workload_profile")
+            for profile in additive_profiles:
+                if profile["label"] == label:
+                    cases = profile["cases"]
+                    return cases[index] if 0 <= index < len(cases) else None
+            return None
+        return sample_requests[index] if 0 <= index < len(sample_requests) else None
+
     def check_consistent(row):
         if not row["ok"]:
             return False
-        case = sample_requests[row["sample_idx"]]
+        case = _case_for_row(row)
+        if case is None:
+            return False
 
         # A workload file can be model-agnostic (or generated for another model).
         # Skip strict expected-output checks when expected data comes from a different model.

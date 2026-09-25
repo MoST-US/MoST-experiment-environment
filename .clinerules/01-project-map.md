@@ -38,6 +38,14 @@ imports it. Never edit it (it is also excluded via `.clineignore`).
 - `TOKENS_LIST` is a comma-separated list of experiments `inMin-inMax:outMin-outMax` (single values
   and one-sided ranges are accepted). Each entry becomes one experiment folder and one full
   stage-1/stage-2 run.
+- `WORKLOAD_MIXES` is the additive alternative to `TOKENS_LIST`: bracketed mixes
+  `[(profile,alpha),(profile,alpha)],[...]`, where `profile` is `inMin-inMax:outMin-outMax` and
+  `alpha` is its share of the requests (normalised to 1 per mix; a repeated profile sums its
+  alphas). Each bracketed entry becomes one `mix_...` experiment folder and one full
+  stage-1/stage-2 run, and every request is routed to a profile by the loadgen (grammar and
+  canonical rendering live in `workload_mix.py`). When it is set, `TOKENS_LIST` is ignored (the
+  log says so) and `REQ_MIN_START` is consumed per mix. Malformed entries are skipped with a
+  `Warning:`, never by aborting the run.
 
 ## Results tree (as implemented)
 
@@ -45,6 +53,7 @@ imports it. Never edit it (it is also excluded via `.clineignore`).
 results/                                                      # RESULTS_DIR from .env
 └── Experiment_<EXPERIMENT_TYPE>_<YYYY-MM-DD_HH-MM-SS>/       # created by _archive_execution_results()
     └── <in_min>-<in_max>_<out_min>-<out_max>/                # parent_dir per TOKENS_LIST entry
+    └── mix_<label>@<alpha>+.../                              # parent_dir per WORKLOAD_MIXES entry
         └── <YYYY-MM-DD_HH-MM-SS>/                            # one folder per iteration
             ├── results.csv        # the published per-iteration summary (see 02/06)
             ├── results.json       # raw per-token events (fmperf loadgen output, copied)
@@ -55,7 +64,12 @@ results/                                                      # RESULTS_DIR from
 
 - The archive folder is created only at the end of the whole automation run, and it is named with
   the timestamp of that moment; the iteration folder name comes from the first response timestamp
-  inside the CSVs (earliest `received_timestamp`).
+  inside the CSVs (earliest `received_timestamp`). Additive (`WORKLOAD_MIXES`) executions use
+  `Experiment_MIX_<EXPERIMENT_TYPE>_<timestamp>` as the prefix.
+- Additive rows identify their experiment with `WORKLOAD_MIX` and keep the four
+  `MIN/MAX_INPUT/OUTPUT_TOKENS` columns empty on purpose (see 02/03); their parent folder is the
+  canonical mix (`mix_1-100_1-100@0.5+300-600_100-300@0.5`), rendered from safe characters only
+  (no `:`, spaces, parentheses or slashes).
 - Stale facts in `README.md` — do not copy them: the archive is actually prefixed with
   `Experiment_`, results live under `RESULTS_DIR` (not `requests/`), and for two-value
   `TOKENS_LIST` entries the parent folder is `in_out` (no ranges).
