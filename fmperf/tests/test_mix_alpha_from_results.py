@@ -401,6 +401,26 @@ class TestMain(ArchiveTestCase):
         self.assertEqual(payload['suggested_req_min_start'], 210)
         self.assertEqual([p['alpha'] for p in payload['profiles']], [0.952381, 0.047619])
 
+    def test_main_multi_mix_json_is_parseable(self):
+        """A grouped -p is one mix per bracketed group, and --json stays machine readable."""
+        self.build_archive()
+        argv = [
+            '--results', self.archive_name,
+            '-p', '(1-100:1-100,300-600:100-300),(300-600:100-300,1-100:1-100)',
+            '--results-dir', str(self.results_dir),
+            '--json',
+        ]
+        output = self.run_main(argv)
+        payload = json.loads(output[output.index('\n{'):])
+        self.assertEqual(payload['suggested_req_min_starts'], [210, 210])
+        self.assertEqual([mix['k'] for mix in payload['mixes']], [2, 2])
+        self.assertEqual(len(parse_workload_mixes(payload['workload_mixes'])), 2)
+        self.assertIn(
+            'WORKLOAD_MIXES=[(1-100:1-100,0.952381),(300-600:100-300,0.047619)],'
+            '[(300-600:100-300,0.047619),(1-100:1-100,0.952381)]',
+            output,
+        )
+
     def test_main_only_reads(self):
         """The calibration must never write: not into results/ and not into .env."""
         self.build_archive()
@@ -409,6 +429,249 @@ class TestMain(ArchiveTestCase):
         self.run_main(self.main_argv())
         self.assertEqual(before, sorted(str(path) for path in self.results_dir.rglob('*')))
         self.assertEqual(env_before, (REPO_ROOT / '.env').exists())
+
+
+class TestProfileMixParsing(unittest.TestCase):
+    """--profiles parsing: bracketed groups, delimiter tolerances and the warnings they carry."""
+
+    def parse(self, profiles) -> tuple:
+        """Parse `profiles` and return (mixes, skipped, captured stdout)."""
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            mixes, skipped = calibration.parse_profile_mixes(profiles)
+        return mixes, skipped, buffer.getvalue()
+
+    @staticmethod
+    def labels(mixes) -> list:
+        """Profile labels of every parsed mix, in order."""
+        return [mix['labels'] for mix in mixes]
+
+    def test_bracket_free_value_is_a_single_mix(self):
+        mixes, skipped, output = self.parse('1-100:1-100,300-600:100-300')
+        self.assertEqual(self.labels(mixes), [['1-100:1-100', '300-600:100-300']])
+        self.assertEqual([mix['index'] for mix in mixes], [1])
+        self.assertEqual(skipped, [])
+        self.assertEqual(output, '')
+
+    def test_each_bracketed_group_is_one_mix(self):
+        mixes, skipped, output = self.parse('(1-100:1-100,300-600:100-300),(32:64,600-1000:1000-1500)')
+        self.assertEqual(
+            self.labels(mixes),
+            [['1-100:1-100', '300-600:100-300'], ['32-32:64-64', '600-1000:1000-1500']],
+        )
+        self.assertEqual([mix['index'] for mix in mixes], [1, 2])
+        self.assertEqual([mix['raw'] for mix in mixes],
+                         ['1-100:1-100,300-600:100-300', '32:64,600-1000:1000-1500'])
+        self.assertEqual(skipped, [])
+        self.assertEqual(output, '')
+
+    def test_square_brackets_are_accepted(self):
+        """[...] is the delimiter of the .env WORKLOAD_MIXES value, so a pasted value works."""
+        mixes, _, _ = self.parse('[1-100:1-100,300-600:100-300],[32:64]')
+        self.assertEqual(self.labels(mixes), [['1-100:1-100', '300-600:100-300'], ['32-32:64-64']])
+
+    def test_semicolons_separate_profiles_like_commas(self):
+        mixes, _, _ = self.parse('(1-100:1-100;300-600:100-300)')
+        self.assertEqual(self.labels(mixes)[0], ['1-100:1-100', '300-600:100-300'])
+
+    def test_text_outside_the_brackets_is_ignored_with_a_warning(self):
+        mixes, _, output = self.parse('(1-100:1-100,300-600:100-300),junk')
+        self.assertEqual(self.labels(mixes), [['1-100:1-100', '300-600:100-300']])
+        self.assertIn('Warning: ignoring text outside the bracketed mixes: "junk"', output)
+
+    def test_two_colon_output_range_is_read_as_a_range(self):
+        mixes, _, output = self.parse('(1-100:1:100,300-600:100:300)')
+        self.assertEqual(self.labels(mixes), [['1-100:1-100', '300-600:100-300']])
+        self.assertIn('uses the "Y1:Y2" output-range form', output)
+
+    def test_alpha_left_over_from_the_env_form_is_ignored(self):
+        mixes, skipped, output = self.parse('(1-100:1-100,0.5),(300-600:100-300,0.5)')
+        self.assertEqual(self.labels(mixes), [['1-100:1-100'], ['300-600:100-300']])
+        self.assertEqual([entry['label'] for entry in skipped], ['0.5', '0.5'])
+        self.assertEqual([entry['label'] for mix in mixes for entry in mix['skipped']],
+                         ['0.5', '0.5'])
+        self.assertIn('alphas are computed by this script', output)
+
+    def test_a_profile_repeated_inside_a_mix_is_kept_once(self):
+        mixes, skipped, output = self.parse('(1-100:1-100,1-100:1-100,300-600:100-300)')
+        self.assertEqual(self.labels(mixes), [['1-100:1-100', '300-600:100-300']])
+        self.assertEqual([entry['label'] for entry in skipped], ['1-100:1-100'])
+        self.assertIn('the profile is repeated inside the mix', output)
+
+    def test_invalid_chunks_and_empty_groups_are_reported(self):
+        mixes, skipped, output = self.parse('(nope),()')
+        self.assertEqual(self.labels(mixes), [[], []])
+        self.assertEqual([mix['raw'] for mix in mixes], ['nope', ''])
+        self.assertEqual([entry['label'] for entry in skipped], ['nope'])
+        self.assertIn('Warning: skipping profile "nope": not a valid', output)
+        self.assertIn('Warning: skipping workload mix without a valid profile', output)
+
+    def test_single_values_and_ranges_are_canonicalised(self):
+        mixes, _, output = self.parse('(32:64,300-600:100-300)')
+        self.assertEqual(self.labels(mixes), [['32-32:64-64', '300-600:100-300']])
+        self.assertEqual(output, '')
+
+
+class TestMultipleMixes(ArchiveTestCase):
+    """One bracketed group per mix: every mix is calibrated on its own profiles."""
+
+    def build_three_profile_archive(self) -> Path:
+        """The default archive plus a third, heavier profile (MST 10)."""
+        self.build_archive()
+        _write_iteration(
+            self.archive, '600-1000_1000-1500', '2026-09-20_12-00-00',
+            _row(**_interval(600, 1000, 1000, 1500), REQ_MIN=10, FINISHED='TRUE'),
+        )
+        return self.archive
+
+    def test_two_mixes_are_calibrated_and_combined(self):
+        self.build_archive()
+        first = '[(1-100:1-100,0.952381),(300-600:100-300,0.047619)]'
+        second = '[(300-600:100-300,0.047619),(1-100:1-100,0.952381)]'
+        payload, output = self.calibrate(
+            '(1-100:1-100,300-600:100-300),(300-600:100-300,1-100:1-100)'
+        )
+        self.assertEqual(payload['workload_mixes'], f'{first},{second}')
+        self.assertIn(f'WORKLOAD_MIXES={first},{second}', output)
+        self.assertEqual([mix['index'] for mix in payload['mixes']], [1, 2])
+        self.assertEqual(payload['suggested_req_min_starts'], [210, 210])
+        self.assertIn('Suggested REQ_MIN_START=210,210', output)
+        # The combined value is what the automation parses, so it must survive workload_mix.
+        parsed = parse_workload_mixes(payload['workload_mixes'])
+        self.assertEqual(len(parsed), 2)
+        self.assertEqual([mix['parent_dir'] for mix in parsed], payload['parent_dirs'])
+        self.assertIn('Verification: OK (2 mix(es), 4 profile(s)', output)
+
+    def test_each_mix_is_calibrated_on_its_own_profiles(self):
+        self.build_three_profile_archive()
+        payload, output = self.calibrate('(1-100:1-100,300-600:100-300),(1-100:1-100)')
+        first, second = payload['mixes']
+        self.assertEqual(first['sigmas'], [1.0, 20.0])
+        self.assertEqual(first['workload_mixes'],
+                         '[(1-100:1-100,0.952381),(300-600:100-300,0.047619)]')
+        # The single-profile mix uses its own profile as the 1.0 CU reference.
+        self.assertEqual(second['k'], 1)
+        self.assertEqual(second['sigmas'], [1.0])
+        self.assertEqual(second['alphas'], [1.0])
+        self.assertIn('Warning: only one profile (1-100:1-100) of mix 2', output)
+
+    def test_a_profile_of_another_mix_does_not_change_this_mix(self):
+        """Per-mix sigmas: a heavy profile of mix 2 must not move the alphas of mix 1."""
+        self.build_three_profile_archive()
+        alone, _ = self.calibrate('(1-100:1-100,300-600:100-300)')
+        with_second, _ = self.calibrate(
+            '(1-100:1-100,300-600:100-300),(600-1000:1000-1500,1-100:1-100)'
+        )
+        self.assertEqual(with_second['mixes'][0]['workload_mixes'], alone['workload_mixes'])
+        self.assertEqual(with_second['mixes'][0]['alphas'], alone['mixes'][0]['alphas'])
+        self.assertEqual(with_second['mixes'][1]['sigmas'], [40.0, 1.0])
+
+    def test_flat_cu_shares_apply_to_every_mix(self):
+        self.build_archive()
+        payload, output = self.calibrate(
+            '(1-100:1-100,300-600:100-300),(300-600:100-300,1-100:1-100)',
+            cu_shares='0.75,0.25',
+        )
+        for mix in payload['mixes']:
+            self.assertFalse(mix['balanced_alpha_cu'])
+            self.assertEqual([profile['alpha_cu'] for profile in mix['profiles']], [0.75, 0.25])
+        self.assertEqual(payload['mixes'][0]['workload_mixes'],
+                         '[(1-100:1-100,0.983607),(300-600:100-300,0.016393)]')
+        self.assertEqual(payload['mixes'][1]['workload_mixes'],
+                         '[(300-600:100-300,0.130435),(1-100:1-100,0.869565)]')
+        self.assertNotIn('balanced alpha_CU = 1/k (default)', output)
+        self.assertIn('--- Mix 1/2: 1-100:1-100,300-600:100-300 ---', output)
+
+
+    def test_balanced_default_is_computed_per_mix(self):
+        self.build_archive()
+        payload, _ = self.calibrate('(1-100:1-100,300-600:100-300),(1-100:1-100)')
+        self.assertEqual([mix['balanced_alpha_cu'] for mix in payload['mixes']], [True, True])
+        self.assertEqual(payload['mixes'][0]['achieved_alpha_cu'], [0.5, 0.5])
+        self.assertEqual(payload['mixes'][1]['achieved_alpha_cu'], [1.0])
+
+    def test_cu_shares_of_a_differently_sized_mix_raise(self):
+        self.build_three_profile_archive()
+        with self.assertRaises(SystemExit) as context:
+            self.calibrate(
+                '(1-100:1-100,300-600:100-300),'
+                '(1-100:1-100,300-600:100-300,600-1000:1000-1500)',
+                cu_shares='0.5,0.5',
+            )
+        self.assertIn('alpha_CU value(s) in --cu-shares', str(context.exception))
+
+    def test_profile_missing_from_the_archive_degrades_only_its_mix(self):
+        self.build_archive()
+        payload, output = self.calibrate(
+            '(1-100:1-100,300-600:100-300),(700-800:900-1000,1-100:1-100)'
+        )
+        self.assertEqual([mix['k'] for mix in payload['mixes']], [2, 1])
+        self.assertEqual(payload['skipped_profiles'],
+                         [{'label': '700-800:900-1000', 'reason': calibration.NO_CELL_REASON}])
+        self.assertEqual(payload['mixes'][1]['skipped_profiles'], payload['skipped_profiles'])
+        self.assertIn('Warning: skipping profile "700-800:900-1000"', output)
+        self.assertIn('Warning: available cells in the archive', output)
+
+    def test_mix_without_a_calibratable_profile_is_dropped(self):
+        self.build_archive()
+        payload, output = self.calibrate(
+            '(1-100:1-100,300-600:100-300),(700-800:900-1000,800-900:950-1000)'
+        )
+        self.assertEqual(len(payload['mixes']), 1)
+        self.assertIn('Warning: skipping mix 2', output)
+        self.assertEqual(payload['mixes'][0]['index'], 1)
+        # One surviving mix is reported with the single-mix layout and its flat keys.
+        self.assertEqual(payload['k'], 2)
+        self.assertEqual(payload['parent_dir'],
+                         'mix_1-100_1-100@0.952381+300-600_100-300@0.047619')
+
+    def test_no_calibratable_mix_raises(self):
+        self.build_archive()
+        with self.assertRaises(SystemExit) as context:
+            self.calibrate('(700-800:900-1000),(800-900:950-1000)')
+        self.assertIn('none of the requested profiles could be calibrated',
+                      str(context.exception))
+
+    def test_duplicate_mixes_are_reported(self):
+        self.build_archive()
+        payload, output = self.calibrate(
+            '(1-100:1-100,300-600:100-300),(1-100:1-100,300-600:100-300)'
+        )
+        self.assertIn('renders to the same WORKLOAD_MIXES entry as mix 1', output)
+        self.assertEqual(len(payload['mixes']), 2)
+        # The duplicate is visible to the automation: workload_mix keeps a single entry.
+        self.assertEqual(len(parse_workload_mixes(payload['workload_mixes'])), 1)
+        self.assertIn('workload_mix parsed 1 mix(es) instead of 2', output)
+
+    def test_multi_mix_payload_has_no_single_mix_keys(self):
+        self.build_archive()
+        payload, output = self.calibrate('(1-100:1-100),(300-600:100-300)')
+        self.assertNotIn('k', payload)
+        self.assertNotIn('profiles', payload)
+        self.assertNotIn('parent_dir', payload)
+        self.assertEqual(payload['parent_dirs'],
+                         ['mix_1-100_1-100@1', 'mix_300-600_100-300@1'])
+        self.assertEqual(payload['suggested_req_min_starts'], [400, 20])
+        self.assertEqual(payload['calibrated_profiles'][0]['label'], '1-100:1-100')
+        self.assertIn('Verification: OK (2 mix(es), 2 profile(s)', output)
+
+    def test_printed_parent_dir_is_the_folder_the_run_creates(self):
+        """workload_mix renormalises the parsed alphas, so the folder must come from it."""
+        self.build_three_profile_archive()
+        payload, output = self.calibrate('(1-100:1-100,300-600:100-300,600-1000:1000-1500)')
+        parsed = parse_workload_mixes(payload['workload_mixes'])
+        self.assertIn('0.930233', payload['workload_mixes'])
+        self.assertEqual(payload['parent_dir'], parsed[0]['parent_dir'])
+        self.assertNotEqual(payload['parent_dir'], payload['mixes'][0]['rendered_parent_dir'])
+        self.assertIn('Warning: mix 1 renders to', output)
+
+    def test_single_group_payload_keeps_the_flat_keys(self):
+        self.build_archive()
+        payload, _ = self.calibrate('(1-100:1-100,300-600:100-300)')
+        self.assertEqual(payload['k'], 2)
+        self.assertEqual(payload['workload_mixes'], payload['mixes'][0]['workload_mixes'])
+        self.assertEqual(payload['parent_dir'],
+                         'mix_1-100_1-100@0.952381+300-600_100-300@0.047619')
 
 
 if __name__ == '__main__':

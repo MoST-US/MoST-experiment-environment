@@ -29,6 +29,30 @@ Usage examples:
         -p 1-100:1-100,300-600:100-300 --cu-shares 0.5,0.5
     python mix_alpha_from_results.py -r results/Experiment_MST_2026-09-20_10-00-00 \
         -p 32:64,600-1000:1000-1500 --json
+    python mix_alpha_from_results.py -r Experiment_MST_2026-09-20_10-00-00 \
+        -p '(1-100:1-100,300-600:100-300),(1-100:1-100,300-600:100-300,600-1000:1000-1500)'
+
+Workload mixes (`--profiles`):
+- One bracketed group is one workload mix, i.e. one bracketed entry of WORKLOAD_MIXES and one full
+  experiment, and the groups are calibrated in the order they are written:
+
+      --profiles '(profile,profile),(profile,profile,profile)'
+
+  Every mix is calibrated on its own: its profiles are looked up in the archive, their CU costs are
+  derived from the MIT/MST values of that mix (`sigma = max MST of the mix / MST of the profile`, so
+  the most capable profile of the mix is 1.0 CU) and its alphas are computed for its own profile
+  list. Neither the number of mixes nor the profiles of the other mixes change a mix (the alpha
+  formula is invariant to the CU scale, so a shared baseline would give the same request ratios).
+- A value without brackets stays a single mix, exactly like before this format was added, so
+  `--profiles 1-100:1-100,300-600:100-300` keeps working. `[...]` groups are accepted as well,
+  because that is how the .env WORKLOAD_MIXES value delimits its mixes.
+- `--cu-shares` is the alpha_CU vector of one mix, applied to every mix of the list in the profile
+  order of that mix; a mix whose calibrated profile count differs from the vector raises an error.
+  Without it every mix uses its own balanced split 1/k.
+- Inside a group the profiles are bare labels (`inMin-inMax:outMin-outMax`; single values and
+  one-sided ranges allowed, e.g. `32:64`). The `X1-X2:Y1:Y2` spelling of the output range is read as
+  `X1-X2:Y1-Y2` with a warning, and an alpha left over from the .env `(profile,alpha)` form is
+  ignored with a warning, because the alphas are computed here.
 
 Notes:
 - Profiles are always passed explicitly (in mix order) and are matched against the archive through
@@ -41,9 +65,9 @@ Notes:
 - The MIT/MST value of a cell is the `REQ_MIN` of its `FINISHED=TRUE` row; a cell whose experiment
   stopped in the stage-1 iteration hard limit falls back to `LARGEST_TRUE` (with a warning), and a
   cell with no usable value is skipped.
-- `--cu-shares` defaults to the balanced CU split 1/k, so a balanced mix needs no extra argument.
-  The predicted mix rate printed at the end uses the same linear CU model and is an estimate for
-  `REQ_MIN_START`, not a measurement.
+- `--cu-shares` defaults to the balanced CU split 1/k of each mix, so a balanced mix needs no extra
+  argument. The predicted mix rates printed at the end use the same linear CU model and are an
+  estimate for `REQ_MIN_START` (one value per mix, by index), not a measurement.
 
 Standalone (stdlib only) and independent from .env: it can be run before the environment is
 configured, exactly like mix_alpha_calculator.py.
@@ -53,6 +77,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -64,6 +89,7 @@ if str(_ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(_ROOT_DIR))
 
 from mix_alpha_calculator import (  # noqa: E402  (needs the sys.path fix above)
+    VERIFY_TOLERANCE,
     achieved_cu_shares,
     compute_request_ratios,
     format_alpha,
@@ -90,6 +116,11 @@ INTERVAL_COLUMNS = (
 )
 # Glob metacharacters: an archive name containing one is used as a glob as-is.
 _GLOB_CHARS = '*?['
+# One bracketed --profiles group is one workload mix: `(profile,profile),...` is the documented form
+# and `[...]` is accepted too, because that is how WORKLOAD_MIXES delimits its mixes in .env.
+MIX_GROUP_RE = re.compile(r'[\[\(]([^\[\]\(\)]*)[\]\)]')
+# Reason reported for a profile the archive cannot calibrate because it has no such interval.
+NO_CELL_REASON = 'the archive has no cell with this interval'
 
 
 def _read_env_value(env_path, key, default=''):
@@ -357,41 +388,131 @@ def _format_available_cells(cells) -> str:
     ) or '<none>'
 
 
-def _resolve_profiles(profiles_arg, cells):
-    """Match every requested profile label to a cell of the archive, keeping the mix order.
+def _normalise_profile_label(text):
+    """Canonicalise one profile written in --profiles; returns None when it is not a profile label.
 
-    Returns `(matched, skipped)`: the `(label, cell_info)` pairs in mix order, plus the
-    `(label, reason)` pairs that could not be matched. Unparsable labels and labels without a cell
-    are only reported with a warning (never a fatal error), because one unavailable profile must not
-    stop the calibration of the others; the warnings are printed here, the skipped list is returned
-    so the caller can expose it (JSON payload) without duplicating the messages.
+    `workload_mix` stays the single source of truth for the profile grammar (`32:64` and
+    `32-32:64-64` are the same profile, and anything the loadgen would reject is rejected here). The
+    only extra tolerance is the `X1-X2:Y1:Y2` spelling of the output range: a valid profile never
+    carries two ':', so that form is unambiguous and is read as `X1-X2:Y1-Y2`.
     """
-    matched = []
-    skipped = []
-    for raw_label in str(profiles_arg or '').split(','):
-        label = raw_label.strip()
-        if not label:
-            continue
-        profile = _label_ranges(label)
-        if profile is None:
-            skipped.append((label, 'not a valid inMin-inMax:outMin-outMax profile label'))
-            continue
-        cell = cells.get((
-            profile['in_min'],
-            profile['in_max'],
-            profile['out_min'],
-            profile['out_max'],
-        ))
-        if cell is None:
-            skipped.append((profile['label'], 'the archive has no cell with this interval'))
-            continue
-        matched.append((profile['label'], cell))
+    label = str(text or '').strip()
+    if not label:
+        return None
+    if label.count(':') > 1:
+        in_part, out_part = label.split(':', 1)
+        canonical = f'{in_part.strip()}:{out_part.strip().replace(":", "-")}'
+        profile = _label_ranges(canonical)
+        if profile is not None:
+            print(
+                f'Warning: profile "{label}" uses the "Y1:Y2" output-range form; reading it as '
+                f'{profile["label"]} (canonical form: inMin-inMax:outMin-outMax).'
+            )
+        return profile
+    return _label_ranges(label)
 
-    for label, reason in skipped:
-        print(f'Warning: skipping profile "{label}": {reason}')
-    if skipped:
-        print(f'Warning: available cells in the archive: {_format_available_cells(cells)}')
-    return matched, skipped
+
+def _looks_like_alpha(text) -> bool:
+    """True when a chunk can only be an alpha: a profile label always carries one ':'."""
+    return ':' not in str(text) and _parse_number(text) is not None
+
+
+def split_mix_groups(profiles_arg) -> list:
+    """Split --profiles into the raw text of its mixes (one group per mix, in order).
+
+    `(p,p),(p,p,p)` is the documented form and `[p,p],[p,p,p]` (the delimiters of the .env
+    WORKLOAD_MIXES value) is accepted too. Without any bracket the whole value is a single mix, which
+    keeps `--profiles 1-100:1-100,300-600:100-300` valid. Text left outside the brackets (for
+    example an unbalanced tail) is ignored with a `Warning:` instead of being silently dropped.
+    """
+    text = str(profiles_arg or '').strip()
+    if not text:
+        return []
+    groups = [group.strip() for group in MIX_GROUP_RE.findall(text)]
+    if not groups:
+        return [text]
+    leftover = MIX_GROUP_RE.sub(',', text).strip(' \t\r\n,;')
+    if leftover:
+        print(f'Warning: ignoring text outside the bracketed mixes: "{leftover}"')
+    return groups
+
+
+def parse_profile_mixes(profiles_arg):
+    """Parse --profiles into its mixes, each one keeping its own profile order.
+
+    Returns `(mixes, skipped)`: every mix is `{'index', 'raw', 'labels', 'skipped'}` (canonical
+    labels, in the order they were written) and `skipped` collects the `{'label', 'reason'}` entries
+    dropped while parsing, in the shape of the JSON payload (each mix also carries the entries that
+    concern it). Malformed chunks, leftovers of the .env `(profile,alpha)` form and a profile
+    repeated inside one mix are reported with a `Warning:` and never abort the calibration. A mix
+    without a valid profile is kept here so the mix indices stay aligned with the WORKLOAD_MIXES
+    order, and is dropped once calibrated.
+    """
+    mixes = []
+    skipped = []
+    for index, raw_group in enumerate(split_mix_groups(profiles_arg), start=1):
+        labels = []
+        mix_skipped = []
+        for chunk in raw_group.replace(';', ',').split(','):
+            text = chunk.strip()
+            if not text:
+                continue
+            if _looks_like_alpha(text):
+                entry = {
+                    'label': text,
+                    'reason': ('alphas are computed by this script; pass the profile without its '
+                               'alpha'),
+                }
+            else:
+                profile = _normalise_profile_label(text)
+                if profile is None:
+                    entry = {
+                        'label': text,
+                        'reason': 'not a valid inMin-inMax:outMin-outMax profile label',
+                    }
+                elif profile['label'] in labels:
+                    entry = {
+                        'label': profile['label'],
+                        'reason': ('the profile is repeated inside the mix; its first occurrence is '
+                                   'kept'),
+                    }
+                else:
+                    labels.append(profile['label'])
+                    continue
+            mix_skipped.append(entry)
+            skipped.append(entry)
+            print(f'Warning: skipping profile "{entry["label"]}": {entry["reason"]}')
+        if not labels:
+            print(f'Warning: skipping workload mix without a valid profile: "{raw_group}"')
+        mixes.append({
+            'index': index,
+            'raw': raw_group,
+            'labels': labels,
+            'skipped': mix_skipped,
+        })
+    return mixes, skipped
+
+
+def _cell_for_label(label, cells):
+    """Archive cell of one canonical profile label, or None when the archive has no such cell."""
+    profile = _label_ranges(label)
+    if profile is None:
+        return None
+    return cells.get((
+        profile['in_min'],
+        profile['in_max'],
+        profile['out_min'],
+        profile['out_max'],
+    ))
+
+
+def _add_skip(skipped, mixes, label, reason) -> None:
+    """Record one dropped profile in the payload list and in the mixes that requested it."""
+    entry = {'label': label, 'reason': reason}
+    skipped.append(entry)
+    for mix in mixes:
+        if label in mix['labels']:
+            mix['skipped'].append(entry)
 
 
 def sigma_from_req_min(req_mins):
@@ -436,7 +557,7 @@ def _resolve_cu_shares(text, k):
     if len(shares) != k:
         raise SystemExit(
             f'Error: {len(shares)} alpha_CU value(s) in --cu-shares for {k} calibrated profile(s); '
-            'pass one value per profile in mix order.'
+            'pass one value per profile in mix order (the vector is applied to every mix).'
         )
     if any(share < 0 for share in shares):
         raise SystemExit('Error: every alpha_CU must be >= 0.')
@@ -488,102 +609,56 @@ def _print_calibration_table(rows) -> None:
         )
 
 
-def calibrate(results_name, profiles, cu_shares_text=None, results_dir_arg=None) -> dict:
-    """Calibrate the requested profiles from an archive and print the whole report.
+def _resolve_parent_dir(labels, alphas, mix_value):
+    """Report the `mix_...` folder the automation will create, plus its rendered value when it differs.
 
-    Returns the calibration payload (also emitted as JSON by --json and used by the unit tests).
-    Raises SystemExit with an `Error:` message when the archive as a whole is unusable; a single
-    profile without a cell or without a usable REQ_MIN is skipped with a `Warning:` so the other
-    profiles stay calibratable.
+    `workload_mix.parse_workload_mixes` renormalises the alphas it reads, so a mix whose 6-decimal
+    alphas do not sum to exactly 1 (for example 0.930233,0.046512,0.023256) produces a folder whose
+    last decimal differs from the one `render_parent_dir` computes. The parsed folder is the one
+    requests/store_results.py really creates (experiment_automation.py reads `workload_mix
+    ['parent_dir']`), so it is the value reported here; the rendered one is returned only when it
+    differs, so the caller can warn about it (None when they agree).
     """
-    results_dir = resolve_results_dir(results_dir_arg)
-    archive = resolve_archive(results_name, results_dir)
-    print(f'Results archive: {archive}')
+    rendered = render_parent_dir(labels, alphas)
+    parsed = parse_workload_mixes(mix_value)
+    if len(parsed) == 1 and [profile['label'] for profile in parsed[0]['profiles']] == list(labels):
+        folder = parsed[0]['parent_dir']
+        return folder, (rendered if rendered != folder else None)
+    return rendered, None
 
-    cells, additive_rows = scan_cells(archive)
-    if not cells:
-        if additive_rows:
-            raise SystemExit(
-                f'Error: {archive} only holds additive (WORKLOAD_MIX) rows; the alphas of a mix '
-                'must be calibrated from single-interval (TOKENS_LIST) experiments.'
-            )
-        raise SystemExit(f'Error: no {RESULTS_CSV} with a token interval found under {archive}.')
-    print(f'Calibration cells found: {len(cells)} ({_format_available_cells(cells)})')
-    if additive_rows:
-        print(f'Warning: ignored {additive_rows} additive (WORKLOAD_MIX) row(s) of the archive.')
 
-    rows = []
-    records = []
-    matched, skipped = _resolve_profiles(profiles, cells)
-    for label, cell in matched:
-        records.extend(cell['records'])
-        value, note, record = select_calibration_value(cell['records'])
-        if value is None or record is None:
-            skipped.append((label, note))
-            print(f'Warning: skipping profile "{label}": {note}')
-            continue
-        rows.append({
-            'label': label,
-            'cell': record['parent_dir'],
-            'source': record['source'],
-            'iterations': len(cell['records']),
-            'req_min': value,
-            'evaluation': record['evaluation'],
-            'finished': record['finished'],
-            'stage': record['stage'],
-            'termination_reason': record['termination_reason'],
-            'note': note,
-        })
-    if not rows:
-        raise SystemExit('Error: none of the requested profiles could be calibrated.')
+def _build_calibrated_mix(spec, row_by_label, cu_shares_text):
+    """Calibrate one parsed mix into its sigmas, alphas, folder name and REQ_MIN_START prediction.
 
-    labels = [row['label'] for row in rows]
+    Returns None (with a `Warning:`) when none of its profiles could be calibrated, so a mix with an
+    unusable roster never hides the mixes that are fine. Every mix is calibrated on its own profile
+    list: sigma uses the most capable profile *of that mix* as the 1.0 CU reference and the alphas
+    are computed over its own profiles. That keeps the mixes independent (the alpha formula is
+    invariant to a common CU factor, so a shared baseline would give the same request ratios).
+    """
+    labels = [label for label in spec['labels'] if label in row_by_label]
+    if not labels:
+        print(
+            f'Warning: skipping mix {spec["index"]} ("{spec["raw"]}"): none of its profiles could be '
+            'calibrated.'
+        )
+        return None
+    rows = [row_by_label[label] for label in labels]
     req_mins = [row['req_min'] for row in rows]
-    k = len(rows)
     sigmas = sigma_from_req_min(req_mins)
-    cu_shares, balanced = _resolve_cu_shares(cu_shares_text, k)
+    cu_shares, balanced = _resolve_cu_shares(cu_shares_text, len(labels))
     alphas = compute_request_ratios(sigmas, cu_shares)
     achieved = achieved_cu_shares(alphas, sigmas)
-    mix_value = render_mix(labels, alphas)
-    parent_dir = render_parent_dir(labels, alphas)
     predicted = sum(share * req_min for share, req_min in zip(cu_shares, req_mins))
-
-    metadata = _metadata_summary(records)
-    if metadata:
-        print(metadata)
-    print()
-    _print_calibration_table(rows)
-    for row in rows:
-        if row['note'] != FINISHED_ROW_NOTE:
-            print(f'Warning: profile "{row["label"]}": {row["note"]}')
-    print()
-    print('sigma (CU per request, most capable calibrated profile = 1): '
-          + ', '.join(format_number(sigma) for sigma in sigmas))
-    print()
-    target = 'balanced alpha_CU = 1/k (default)' if balanced else 'alpha_CU from --cu-shares'
-    print(f'k = {k} profile(s)   |   target = {target}')
-    print()
-    print_table(labels, sigmas, cu_shares, alphas, achieved)
-    print_summary(labels, alphas, cu_shares, achieved)
-    print()
-    if k < 2:
-        print(
-            f'Warning: only one profile ({labels[0]}) was calibrated; a mix needs at least two, so '
-            'this WORKLOAD_MIXES value is a single-profile (non-additive) experiment.'
-        )
-    print(f'WORKLOAD_MIXES={mix_value}')
-    print(f'parent folder: {parent_dir}')
-    print('Predicted mix request rate (linear CU model, sum alpha_CU * REQ_MIN): '
-          f'{format_number(predicted)} requests/min')
-    print(f'Suggested REQ_MIN_START={int(round(predicted))}')
-    verify_mix(mix_value, labels, alphas)
-
+    mix_value = render_mix(labels, alphas)
+    parent_dir, rendered_parent_dir = _resolve_parent_dir(labels, alphas, mix_value)
     return {
-        'archive': str(archive),
-        'results_dir': str(results_dir),
-        'metadata': metadata,
-        'k': k,
+        'index': spec['index'],
+        'raw': spec['raw'],
+        'k': len(labels),
         'balanced_alpha_cu': balanced,
+        # Per-profile view (same fields as the flat payload of a single mix); 'alpha' is the rendered
+        # 6-decimal value written in .env, while the mix-level 'alphas' keeps the exact ratio.
         'profiles': [
             {
                 'label': row['label'],
@@ -601,14 +676,301 @@ def calibrate(results_name, profiles, cu_shares_text=None, results_dir_arg=None)
             }
             for row, sigma, share, alpha, real in zip(rows, sigmas, cu_shares, alphas, achieved)
         ],
-        'skipped_profiles': [
-            {'label': label, 'reason': reason} for label, reason in skipped
-        ],
+        'sigmas': sigmas,
+        'target_alpha_cu': cu_shares,
+        'alphas': alphas,
+        'achieved_alpha_cu': achieved,
+        'skipped_profiles': list(spec['skipped']),
         'workload_mixes': mix_value,
         'parent_dir': parent_dir,
+        # Folder rendered from the exact alphas; None when it is the one workload_mix will create.
+        'rendered_parent_dir': rendered_parent_dir,
         'predicted_requests_per_minute': predicted,
         'suggested_req_min_start': int(round(predicted)),
     }
+
+
+def _single_profile_warning(mix, total) -> str:
+    """Message printed when a mix ended up with a single calibrated profile."""
+    label = mix['profiles'][0]['label']
+    if total > 1:
+        return (
+            f'Warning: only one profile ({label}) of mix {mix["index"]} was calibrated; a mix needs '
+            'at least two, so this WORKLOAD_MIXES entry is a single-profile (non-additive) '
+            'experiment.'
+        )
+    return (
+        f'Warning: only one profile ({label}) was calibrated; a mix needs at least two, so this '
+        'WORKLOAD_MIXES value is a single-profile (non-additive) experiment.'
+    )
+
+
+def _print_mix_block(mix, total) -> None:
+    """Print one mix: its header (when there are several), its sigmas, its target and its table."""
+    if total > 1:
+        print(f'--- Mix {mix["index"]}/{total}: {mix["raw"]} ---')
+    print('sigma (CU per request, most capable calibrated profile = 1): '
+          + ', '.join(format_number(sigma) for sigma in mix['sigmas']))
+    print()
+    target = ('balanced alpha_CU = 1/k (default)' if mix['balanced_alpha_cu']
+              else 'alpha_CU from --cu-shares')
+    print(f'k = {mix["k"]} profile(s)   |   target = {target}')
+    print()
+    labels = [profile['label'] for profile in mix['profiles']]
+    print_table(labels, mix['sigmas'], mix['target_alpha_cu'], mix['alphas'],
+                mix['achieved_alpha_cu'])
+    print_summary(labels, mix['alphas'], mix['target_alpha_cu'], mix['achieved_alpha_cu'])
+    print()
+    if mix['k'] < 2:
+        print(_single_profile_warning(mix, total))
+
+
+def _print_report(mixes, rows, metadata) -> None:
+    """Print the metadata, the calibration table of every calibrated profile and one block per mix.
+
+    The table is per profile (not per mix occurrence) because a profile shared by several mixes is
+    calibrated once; the sigmas of each mix are printed in its own block.
+    """
+    if metadata:
+        print(metadata)
+    print()
+    _print_calibration_table(rows)
+    for row in rows:
+        if row['note'] != FINISHED_ROW_NOTE:
+            print(f'Warning: profile "{row["label"]}": {row["note"]}')
+    print()
+    for mix in mixes:
+        _print_mix_block(mix, len(mixes))
+
+
+
+def _warn_duplicate_mixes(mixes) -> None:
+    """Warn when two mixes render to the same WORKLOAD_MIXES entry.
+
+    `workload_mix.parse_workload_mixes` keeps a duplicated mix only once, so the automation would run
+    that entry once even though the calibration list contains it twice.
+    """
+    first_index = {}
+    for mix in mixes:
+        previous = first_index.get(mix['workload_mixes'])
+        if previous is None:
+            first_index[mix['workload_mixes']] = mix['index']
+            continue
+        print(
+            f'Warning: mix {mix["index"]} renders to the same WORKLOAD_MIXES entry as mix '
+            f'{previous}; workload_mix.parse_workload_mixes runs a duplicated mix only once.'
+        )
+
+
+def _verify_mixes(combined_value, mixes) -> None:
+    """Re-parse the combined WORKLOAD_MIXES value through workload_mix.
+
+    `mix_alpha_calculator.verify_mix` only verifies a single mix, so the multi-mix case is checked
+    here with the same idea: one parsed mix per rendered mix, the same profiles in the same order and
+    the same alphas after the 6-decimal rendering plus the renormalisation done by the parser.
+    """
+    parsed_mixes = parse_workload_mixes(combined_value)
+    if len(parsed_mixes) != len(mixes):
+        print(
+            f'Warning: verification failed, workload_mix parsed {len(parsed_mixes)} mix(es) instead '
+            f'of {len(mixes)} (duplicated or malformed entries).'
+        )
+        return
+    deviation = 0.0
+    for parsed, mix in zip(parsed_mixes, mixes):
+        labels = [profile['label'] for profile in mix['profiles']]
+        want = [float(format_alpha(alpha)) for alpha in mix['alphas']]
+        total = sum(want) or 1.0
+        expected = [alpha / total for alpha in want]
+        parsed_labels = [profile['label'] for profile in parsed['profiles']]
+        if parsed_labels != labels or len(parsed['profiles']) != len(expected):
+            print(
+                f'Warning: verification failed, workload_mix read the profiles of mix '
+                f'{mix["index"]} as {parsed_labels} instead of {labels}.'
+            )
+            return
+        deviation = max(
+            deviation,
+            max(
+                (abs(profile['alpha'] - alpha)
+                 for profile, alpha in zip(parsed['profiles'], expected)),
+                default=0.0,
+            ),
+        )
+    if deviation > VERIFY_TOLERANCE:
+        print(f'Warning: verification mismatch, max alpha deviation {deviation:.2e}.')
+        return
+    print(f'Verification: OK ({len(mixes)} mix(es), {sum(mix["k"] for mix in mixes)} profile(s), '
+          f'max deviation {deviation:.2e})')
+    print('Verification: canonical mixes  ' + ','.join(mix['workload_mixes'] for mix in mixes))
+    print('Verification: parent folders  ' + ', '.join(mix['parent_dir'] for mix in mixes))
+
+
+def _warn_rendered_parent_dirs(mixes) -> None:
+    """Warn when the folder rendered from the exact alphas is not the folder the run will create."""
+    for mix in mixes:
+        if mix['rendered_parent_dir']:
+            print(
+                f'Warning: mix {mix["index"]} renders to {mix["rendered_parent_dir"]}, but '
+                f'workload_mix creates {mix["parent_dir"]} (it renormalises the 6-decimal alphas); '
+                f'using {mix["parent_dir"]}.'
+            )
+
+
+def _print_final_block(mixes, combined_value) -> None:
+    """Print the values to paste in .env: WORKLOAD_MIXES, the parent folders and REQ_MIN_START."""
+    _warn_duplicate_mixes(mixes)
+    _warn_rendered_parent_dirs(mixes)
+    if len(mixes) > 1:
+        print(f'WORKLOAD_MIXES={combined_value}')
+        print('parent folders: ' + ', '.join(mix['parent_dir'] for mix in mixes))
+        print(
+            'Predicted mix request rates per mix (linear CU model, sum alpha_CU * REQ_MIN): '
+            + ', '.join(format_number(mix['predicted_requests_per_minute']) for mix in mixes)
+            + ' requests/min'
+        )
+        print('Suggested REQ_MIN_START='
+              + ','.join(str(mix['suggested_req_min_start']) for mix in mixes))
+        _verify_mixes(combined_value, mixes)
+        return
+    mix = mixes[0]
+    labels = [profile['label'] for profile in mix['profiles']]
+    print(f'WORKLOAD_MIXES={combined_value}')
+    print(f'parent folder: {mix["parent_dir"]}')
+    print('Predicted mix request rate (linear CU model, sum alpha_CU * REQ_MIN): '
+          f'{format_number(mix["predicted_requests_per_minute"])} requests/min')
+    print(f'Suggested REQ_MIN_START={mix["suggested_req_min_start"]}')
+    verify_mix(combined_value, labels, mix['alphas'])
+
+
+def calibrate(results_name, profiles, cu_shares_text=None, results_dir_arg=None) -> dict:
+    """Calibrate the requested workload mixes from an archive and print the whole report.
+
+    `profiles` is either one mix (`p,p`) or several bracketed mixes (`(p,p),(p,p,p)`); every mix is
+    calibrated on its own profile list, so the mixes of a list are independent of each other.
+
+    Returns the calibration payload (also emitted as JSON by --json and used by the unit tests).
+    Raises SystemExit with an `Error:` message when the archive as a whole is unusable or when a mix
+    cannot honour --cu-shares; a single profile without a cell or without a usable REQ_MIN is skipped
+    with a `Warning:` so the other profiles (and mixes) stay calibratable.
+    """
+    results_dir = resolve_results_dir(results_dir_arg)
+    archive = resolve_archive(results_name, results_dir)
+    print(f'Results archive: {archive}')
+
+    cells, additive_rows = scan_cells(archive)
+    if not cells:
+        if additive_rows:
+            raise SystemExit(
+                f'Error: {archive} only holds additive (WORKLOAD_MIX) rows; the alphas of a mix '
+                'must be calibrated from single-interval (TOKENS_LIST) experiments.'
+            )
+        raise SystemExit(f'Error: no {RESULTS_CSV} with a token interval found under {archive}.')
+    print(f'Calibration cells found: {len(cells)} ({_format_available_cells(cells)})')
+    if additive_rows:
+        print(f'Warning: ignored {additive_rows} additive (WORKLOAD_MIX) row(s) of the archive.')
+
+    mixes_spec, skipped = parse_profile_mixes(profiles)
+    if not mixes_spec:
+        raise SystemExit('Error: no profile to calibrate; pass --profiles <profile>,<profile>.')
+
+    # The archive lookup and the calibration table are per profile: a profile used by several mixes
+    # is calibrated once and every mix then reads its own sigmas from those values.
+    labels_in_order = [label for mix in mixes_spec for label in mix['labels']]
+    cell_by_label = {}
+    missing = []
+    for label in dict.fromkeys(labels_in_order):
+        cell = _cell_for_label(label, cells)
+        if cell is None:
+            missing.append(label)
+        else:
+            cell_by_label[label] = cell
+    for label in missing:
+        print(f'Warning: skipping profile "{label}": {NO_CELL_REASON}')
+        _add_skip(skipped, mixes_spec, label, NO_CELL_REASON)
+    if missing:
+        print(f'Warning: available cells in the archive: {_format_available_cells(cells)}')
+
+    rows = []
+    records = []
+    for label in dict.fromkeys(labels_in_order):
+        cell = cell_by_label.get(label)
+        if cell is None:
+            continue
+        value, note, record = select_calibration_value(cell['records'])
+        if value is None or record is None:
+            print(f'Warning: skipping profile "{label}": {note}')
+            _add_skip(skipped, mixes_spec, label, note)
+            continue
+        records.extend(cell['records'])
+        rows.append({
+            'label': label,
+            'cell': record['parent_dir'],
+            'source': record['source'],
+            'iterations': len(cell['records']),
+            'req_min': value,
+            'evaluation': record['evaluation'],
+            'finished': record['finished'],
+            'stage': record['stage'],
+            'termination_reason': record['termination_reason'],
+            'note': note,
+        })
+    if not rows:
+        raise SystemExit('Error: none of the requested profiles could be calibrated.')
+
+    row_by_label = {row['label']: row for row in rows}
+    mixes = []
+    for spec in mixes_spec:
+        mix = _build_calibrated_mix(spec, row_by_label, cu_shares_text)
+        if mix is not None:
+            mixes.append(mix)
+    if not mixes:
+        raise SystemExit('Error: none of the requested mixes could be calibrated.')
+
+    metadata = _metadata_summary(records)
+    _print_report(mixes, rows, metadata)
+    combined_mix_value = ','.join(mix['workload_mixes'] for mix in mixes)
+    _print_final_block(mixes, combined_mix_value)
+
+    payload = {
+        'archive': str(archive),
+        'results_dir': str(results_dir),
+        'metadata': metadata,
+        'calibrated_profiles': [
+            {
+                'label': row['label'],
+                'cell': row['cell'],
+                'source': row['source'],
+                'iterations': row['iterations'],
+                'req_min': row['req_min'],
+                'stage': row['stage'],
+                'termination_reason': row['termination_reason'],
+                'value_note': row['note'],
+            }
+            for row in rows
+        ],
+        'skipped_profiles': skipped,
+        'mixes': mixes,
+        'workload_mixes': combined_mix_value,
+        'parent_dirs': [mix['parent_dir'] for mix in mixes],
+        'predicted_requests_per_minute_per_mix': [
+            mix['predicted_requests_per_minute'] for mix in mixes
+        ],
+        'suggested_req_min_starts': [mix['suggested_req_min_start'] for mix in mixes],
+    }
+    if len(mixes) == 1:
+        # Flat keys of a single-mix calibration: kept for the consumers of the pre-group format, so
+        # `-p 1-100:1-100,300-600:100-300` produces the same JSON as before.
+        only = mixes[0]
+        payload.update({
+            'k': only['k'],
+            'balanced_alpha_cu': only['balanced_alpha_cu'],
+            'profiles': only['profiles'],
+            'parent_dir': only['parent_dir'],
+            'predicted_requests_per_minute': only['predicted_requests_per_minute'],
+            'suggested_req_min_start': only['suggested_req_min_start'],
+        })
+    return payload
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -629,16 +991,18 @@ def _build_parser() -> argparse.ArgumentParser:
         '-p',
         '--profiles',
         required=True,
-        help='Comma-separated profiles of the mix, in mix order, each inMin-inMax:outMin-outMax '
-        '(single values and one-sided ranges allowed, e.g. 32:64); every profile is looked up in '
-        'the archive',
+        help='Profiles of one mix, in mix order, each inMin-inMax:outMin-outMax (single values and '
+        'one-sided ranges allowed, e.g. 32:64); every profile is looked up in the archive. Several '
+        'mixes: one bracketed group each, e.g. (1-100:1-100,300-600:100-300),'
+        '(32:64,600-1000:1000-1500), calibrated independently',
     )
     parser.add_argument(
         '--cu-shares',
         type=str,
         default=None,
-        help='Comma-separated target CU-load fraction (alpha_CU) per profile, in mix order; '
-        'defaults to the balanced split 1/k and is normalised when it does not sum to 1',
+        help='Comma-separated target CU-load fraction (alpha_CU) per profile, in mix order; the same '
+        'vector is applied to every mix and it defaults to the balanced split 1/k of each mix, '
+        'normalised when it does not sum to 1',
     )
     parser.add_argument(
         '--results-dir',
