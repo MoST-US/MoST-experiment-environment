@@ -25,6 +25,11 @@ Usage examples:
     python mix_alpha_calculator.py -k 2                            # prompts for sigma and alpha_CU
     python mix_alpha_calculator.py -k 2 --sigmas 1,20 --labels 1-100:1-100,300-600:100-300 --verify
 
+Companion script: `mix_alpha_from_results.py` derives `sigma` automatically from the MIT/MST
+values recorded in a previous results archive (`REQ_MIN` of the `FINISHED=TRUE` row of every
+token-interval cell) and prints the same `WORKLOAD_MIXES=` line, so both tools stay consistent
+(the calibration script imports the rendering helpers of this one).
+
 Notes:
 - `--cu-shares` defaults to the balanced pressure (equipartition centroid) point
   alpha_CU(p_i) = 1/k for every i, so a balanced CU split needs no extra arguments.
@@ -338,6 +343,45 @@ def _verify(mix_value, labels, alphas) -> None:
     print(f"Verification: canonical mix  {mixes[0]['canonical']}")
     print(f"Verification: parent folder  {mixes[0]['parent_dir']}")
 
+
+# --- Public helpers --------------------------------------------------------
+# Thin aliases around the helpers above, used by the companion calibration script
+# (mix_alpha_from_results.py) so the rendering of the .env values, the printed tables and the
+# verification stay single-sourced. They add no behaviour of their own.
+
+def format_alpha(alpha) -> str:
+    """Public alias of _format_alpha: alpha rendered as stored in .env (6 decimals, trimmed)."""
+    return _format_alpha(alpha)
+
+
+def format_number(value) -> str:
+    """Public alias of _format_number: compact rendering of a sigma / alpha_CU value."""
+    return _format_number(value)
+
+
+def render_mix(labels, alphas) -> str:
+    """Public alias of _render_mix: canonical `[(label,alpha),...]` value of a mix."""
+    return _render_mix(labels, alphas)
+
+
+def render_parent_dir(labels, alphas) -> str:
+    """Public alias of _render_parent_dir: mix_... folder name derived from a mix."""
+    return _render_parent_dir(labels, alphas)
+
+
+def print_table(labels, sigmas, cu_shares, alphas, achieved) -> None:
+    """Public alias of _print_table: per-profile sigma / alpha_CU / alpha comparison."""
+    return _print_table(labels, sigmas, cu_shares, alphas, achieved)
+
+
+def print_summary(labels, alphas, cu_shares, achieved) -> None:
+    """Public alias of _print_summary: alpha vector, residual and per-profile warnings."""
+    return _print_summary(labels, alphas, cu_shares, achieved)
+
+
+def verify_mix(mix_value, labels, alphas) -> None:
+    """Public alias of _verify: re-parse the generated mix through workload_mix."""
+    return _verify(mix_value, labels, alphas)
 
 
 def main() -> None:
