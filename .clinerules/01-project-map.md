@@ -7,7 +7,7 @@ MoST-specific experiment harness. Decide which layer you are touching before edi
 
 | Layer | Paths | Nature |
 | --- | --- | --- |
-| MoST harness (this project's own code) | `experiment_automation.py`, `requests/*.py`, `generate_requests.py`, `*.slurm`, `.env.example`, `experiment_setting.txt`, `README.md` | Actively developed: drives the experiments and writes the published results |
+| MoST harness (this project's own code) | `experiment_automation.py`, `requests/*.py`, `generate_requests.py`, `*.slurm`, `submit_experiment.sh`, `.env.example`, `experiment_setting.txt`, `README.md` | Actively developed: drives the experiments and writes the published results |
 | Upstream fmperf (vendored) | `fmperf/**`, `examples/**`, `docs/**`, `Dockerfile`, `Makefile`, `setup.py`, `requirements.txt` | Upstream benchmark / k8s / energy code; keep changes minimal (see 07) |
 
 Dead code: the root-level `loadgen` file is a stale copy of `fmperf/loadgen/run.py` and nothing
@@ -20,7 +20,9 @@ imports it. Never edit it (it is also excluded via `.clineignore`).
 - Python 3.11. Dependencies come from `requirements.txt` only (pandas, numpy, scipy, statsmodels,
   PyYAML, ...). There is no `requirements-dev.txt`, although `Dockerfile` and `Makefile` reference
   one — `make install-dev/venv-dev/format/lint/type-check` will fail until it exists.
-- Entry point: `python experiment_automation.py`, or `sbatch experiment_automation.slurm`.
+- Entry point: `python experiment_automation.py`, `sbatch experiment_automation.slurm` (Slurm then
+  picks any free A30 node) or `bash submit_experiment.sh` (same job, plus `--nodelist` when
+  `NODE_LIST` is set).
 - `fmperf/utils/constants.py` calls `load_dotenv()` **and** reads `os.environ["REQUESTS_FILENAME"]`
   at import time, so nothing runs (or imports cleanly) without a `.env` next to the code.
 
@@ -29,6 +31,9 @@ imports it. Never edit it (it is also excluded via `.clineignore`).
 - `.env` is the single source of truth at run time and `.env.example` is its tracked
   documentation — update the example whenever a knob changes. `.env` must never be written by code
   (see 02 for the in-process env mechanism).
+- `NODE_LIST` is **submission-only**: it is read by `submit_experiment.sh` (shell environment →
+  `.env`) and forwarded to Slurm as `--nodelist`. No Python code reads it, and Slurm reads `#SBATCH`
+  lines as literal text, so `experiment_automation.slurm` cannot template the node name.
 - `EXPERIMENT_TYPE` selects the evaluation method:
   - **MIT** (Maximum Instantaneous Throughput): short iterations (~2 min); find the requests/min
     point where throughput/response time plateaus.

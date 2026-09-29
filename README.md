@@ -31,6 +31,7 @@ Set your preferences in the [.env](.env) file. Key settings:
 		- The printed block ends with the `WORKLOAD_MIXES=...` line, the `mix_...` folder the run will create and a predicted mix request rate to use as `REQ_MIN_START` (an estimate of the linear CU model, not a measurement).
 - REQ_MIN increase: Set `REQ_MIN_INCREASE_MULTIPLIER` to control growth during stage 1.
 - Stop threshold: Set `STOP_THRESHOLD` for the stage 2 termination criterion.
+- Node selection: Set `NODE_LIST` (a node, a comma-separated list or a nodelist pattern such as `gpu[05-07]`) to pin the compute node used by the Slurm job. It is read at submission time by [submit_experiment.sh](submit_experiment.sh) (exported value first, then [.env](.env)) and passed to Slurm as `--nodelist`; leave it unset and Slurm picks any free A30 node, as before.
 
 Notes:
 - The values `MIN/MAX_INPUT/OUTPUT_TOKENS` are set per iteration from `TOKENS_LIST`; the [.env](.env) file is not modified during runs.
@@ -51,6 +52,14 @@ Alternatively, if SLURM is active and running in the network, create a SLURM job
 ```bash
 sbatch experiment_automation.slurm
 ```
+
+To pin the node that runs the experiment, set `NODE_LIST` in [.env](.env) (or export it) and submit through the wrapper, which adds `--nodelist=<node>` to the submission:
+
+```bash
+bash submit_experiment.sh
+```
+
+Slurm reads `#SBATCH` lines as literal text (variables are not expanded), so the node has to be chosen at submission time: `sbatch experiment_automation.slurm` keeps working unchanged and simply lets Slurm pick any free A30 node. The wrapper also accepts extra `sbatch` options (for example `bash submit_experiment.sh --partition=myqueue`), prints the resolved `NODE_LIST` and its source, and forwards the exit code of `sbatch`.
 
 # Results
 

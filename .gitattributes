@@ -1,0 +1,4 @@
+# The repository is edited on Windows and run on Linux/Slurm. CRLF line breaks break the shebang
+# and the interpreter of a shell script, so *.sh must stay LF in every checkout (this overrides
+# core.autocrlf for these paths). Track new Linux-run shell scripts here.
+*.sh text eol=lf
