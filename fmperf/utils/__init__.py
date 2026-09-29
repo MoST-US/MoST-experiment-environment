@@ -10,3 +10,10 @@ from fmperf.utils.GpuCount import (
     find_model_job_gpu_count,
     read_gpu_count_from_results_csv,
 )
+from fmperf.utils.MergeResultsCsv import (
+    IDENTIFIER_COLUMN,
+    DATE_COLUMN,
+    MergeResultsError,
+    merge_results_csv,
+    run_merge_results,
+)
