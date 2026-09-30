@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --cpus-per-gpu=4 --gpus=a30:1 -t 240:00:00
+#SBATCH -t 240:00:00
 #
 # The node is only filtered by the A30 request above: Slurm picks any free node with an A30 GPU.
 # To pin a specific node, set NODE_LIST in .env and submit through the wrapper
