@@ -1,150 +1,198 @@
-import json
-import csv
+#!/usr/bin/env python3
+"""Convert token-level load-test results into one CSV row per request."""
+
+from __future__ import annotations
+
 import argparse
-import os
+import csv
+import json
+import math
+import statistics
+from datetime import datetime, timezone
 from pathlib import Path
-from collections import defaultdict
-from datetime import datetime
+from typing import Any, Iterable
 
 
-def _read_env_value(env_path: Path, key: str, default: str = "") -> str:
-    try:
-        if env_path.exists():
-            with env_path.open("r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    if line.startswith("export "):
-                        line = line[len("export "):].strip()
-                    if line.startswith(key + "="):
-                        return line.split("=", 1)[1].strip().strip('"').strip("'")
-    except Exception:
-        pass
-    return default
+def timestamp_to_iso(value: Any) -> str:
+    if value is None:
+        return ""
+    timestamp = float(value)
+    magnitude = abs(timestamp)
+    if magnitude >= 1e17:
+        timestamp /= 1e9
+    elif magnitude >= 1e14:
+        timestamp /= 1e6
+    elif magnitude >= 1e11:
+        timestamp /= 1e3
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat(
+        timespec="milliseconds"
+    )
 
 
-def _resolve_results_dir() -> Path:
-    root_dir = Path(__file__).resolve().parent.parent
-    env_path = root_dir / ".env"
-    results_dir = os.environ.get("RESULTS_DIR") or _read_env_value(env_path, "RESULTS_DIR", "results")
-    p = Path(results_dir)
-    if not p.is_absolute():
-        p = root_dir / p
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+def number(values: Iterable[Any]) -> list[float]:
+    return [float(value) for value in values if isinstance(value, (int, float))]
 
-def calculate_completion_time_and_success(json_file_path="results.json", output_csv_path="output.csv"):
-    """
-    Calculate completion time and success rate for each request group, then export to CSV.
 
-    Args:
-        json_file_path: Path to the JSON file containing the response data
-        output_csv_path: Path where the CSV file will be saved
+def percentile(values: list[float], fraction: float) -> float:
+    if not values:
+        return float("nan")
+    return (
+        statistics.quantiles(values, n=100, method="inclusive")[int(fraction * 100) - 1]
+        if len(values) > 1
+        else values[0]
+    )
 
-    Returns:
-        Dictionary with request_idx as keys and completion times as values
-    """
-    # Load data from JSON file
-    with open(json_file_path, 'r') as f:
-        json_data = json.load(f)
 
-    # Extract the results array from the JSON data
-    # Check if the JSON has a "results" key, otherwise use the data directly
-    if "results" in json_data:
-        results_data = json_data["results"]
-    else:
-        results_data = json_data
+def load_records(path: Path) -> list[dict[str, Any]]:
+    with path.open("r", encoding="utf-8-sig") as stream:
+        document = json.load(stream)
+    records = document.get("results") if isinstance(document, dict) else document
+    if not isinstance(records, list) or not all(isinstance(record, dict) for record in records):
+        raise ValueError("Expected a JSON list or an object with a list named 'results'.")
+    return records
 
-    # Group by (worker_idx, request_idx) to avoid collisions across workers
-    request_groups = defaultdict(list)
 
-    for item in results_data:
-        # Backward compatibility: some records may lack worker_idx
-        worker_idx = item.get("worker_idx")
-        request_idx = item.get("request_idx")
-        if request_idx is None:
-            # Skip malformed records without request index
+def load_input_tokens(path: Path) -> dict[tuple[Any, Any], int]:
+    """Load runtime request token counts; missing files preserve legacy behavior."""
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8-sig") as stream:
+        document = json.load(stream)
+    entries = document.get("requests") if isinstance(document, dict) else document
+    if not isinstance(entries, list):
+        raise ValueError(f"Expected {path} to contain a list named 'requests'.")
+
+    counts: dict[tuple[Any, Any], int] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
             continue
-        key = (worker_idx if worker_idx is not None else -1, int(request_idx))
-        request_groups[key].append(item)
+        count = entry.get("input_token_count")
+        if not isinstance(count, (int, float)) or isinstance(count, bool):
+            continue
+        counts[(entry.get("worker_idx"), entry.get("request_idx"))] = int(count)
+    return counts
 
-    # Calculate completion time and success for each request group
-    completion_data = {}
-    total_requests = len(request_groups)
-    successful_requests = 0
 
-    for (worker_idx, request_idx), group in request_groups.items():
-        # Sort the group by timestamp to ensure chronological order
-        group.sort(key=lambda x: x["timestamp"])
+def aggregate_requests(
+    records: Iterable[dict[str, Any]],
+    input_tokens: dict[tuple[Any, Any], int] | None = None,
+    include_text: bool = False,
+) -> list[dict[str, Any]]:
+    grouped: dict[tuple[Any, Any], list[dict[str, Any]]] = {}
+    for position, record in enumerate(records):
+        request_id = record.get("request_idx", f"missing-{position}")
+        grouped.setdefault((record.get("worker_idx"), request_id), []).append(record)
 
-        # Calculate start and end times
-        start = group[0]["timestamp"] - (group[0]["duration_ms"] * 1_000_000)  # Convert ms to nanoseconds
-        end = group[-1]["timestamp"]
-
-        # Calculate completion time in milliseconds
-        completion_time_ms = (end - start) / 1_000_000  # Convert nanoseconds to milliseconds
-        
-        # Check if request is successful (all tokens have ok=True and error="None")
-        is_successful = all(item["ok"] and item["error"] == "None" for item in group)
-        if is_successful:
-            successful_requests += 1
-
-        # Convert end timestamp (assumed to be in nanoseconds since epoch) to formatted string
-        end_dt = datetime.utcfromtimestamp(end / 1_000_000_000)
-        received_timestamp_str = end_dt.strftime('%Y%m%dT%H%M%S')
-
-        # Composite identifier for clarity
-        global_request_id = f"{worker_idx}:{request_idx}"
-
-        completion_data[global_request_id] = {
-            "complete_response_time": completion_time_ms,
-            "received_timestamp": received_timestamp_str,
-            "success": is_successful,
-            "worker_idx": worker_idx,
-            "request_idx": request_idx,
-            "global_request_id": global_request_id,
+    input_tokens = input_tokens or {}
+    rows: list[dict[str, Any]] = []
+    for (worker_id, request_id), request_records in grouped.items():
+        timed_records = [
+            (float(record["timestamp"]), float(record["duration_ms"]))
+            for record in request_records
+            if isinstance(record.get("timestamp"), (int, float))
+            and isinstance(record.get("duration_ms"), (int, float))
+        ]
+        timed_records.sort(key=lambda item: item[0])
+        timestamps = [item[0] for item in timed_records]
+        durations = [item[1] for item in timed_records]
+        first_timestamp = timestamps[0] if timestamps else None
+        last_timestamp = timestamps[-1] if timestamps else None
+        first_token_ms = durations[0] if durations else float("nan")
+        wall_duration_ms = (
+            (last_timestamp - first_timestamp) / 1e6 + first_token_ms
+            if first_timestamp is not None
+            and last_timestamp is not None
+            and not math.isnan(first_token_ms)
+            else float("nan")
+        )
+        request_start = (
+            first_timestamp - first_token_ms * 1e6
+            if first_timestamp is not None and not math.isnan(first_token_ms)
+            else None
+        )
+        token_counts = number(record.get("n_tokens") for record in request_records)
+        texts = [
+            record.get("response", {}).get("text", "")
+            for record in request_records
+            if isinstance(record.get("response"), dict)
+        ]
+        ok_values = [record.get("ok") for record in request_records]
+        generation_intervals = [
+            timestamps[index] - timestamps[index - 1] for index in range(1, len(timestamps))
+        ]
+        durations_ms = durations
+        row: dict[str, Any] = {
+            "request_idx": request_id,
+            "request_sent_at_utc": timestamp_to_iso(request_start),
+            "first_token_at_utc": timestamp_to_iso(first_timestamp),
+            "full_response_received_at_utc": timestamp_to_iso(last_timestamp),
+            "successful_request": all(value is True for value in ok_values),
+            "records_in_request": len(request_records),
+            "response_token_count": sum(token_counts),
+            "input_token_count": input_tokens.get((worker_id, request_id), ""),
+            "output_token_count": sum(token_counts),
+            "first_token_ms": first_token_ms,
+            "request_duration_ms": wall_duration_ms,
+            "token_generation_duration_sum_ms": sum(durations_ms),
+            "token_generation_duration_avg_ms": statistics.mean(durations_ms) if durations_ms else float("nan"),
+            "token_generation_duration_min_ms": min(durations_ms, default=float("nan")),
+            "token_generation_duration_max_ms": max(durations_ms, default=float("nan")),
+            "token_generation_duration_stdev_ms": statistics.stdev(durations_ms) if len(durations_ms) > 1 else float("nan"),
+            "token_generation_duration_p95_ms": percentile(durations_ms, 0.95),
+            "inter_token_interval_avg_ms": statistics.mean(generation_intervals) / 1e6 if generation_intervals else float("nan"),
+            "inter_token_interval_stdev_ms": statistics.stdev(generation_intervals) / 1e6 if len(generation_intervals) > 1 else float("nan"),
+            "tokens_per_second": sum(token_counts) / (wall_duration_ms / 1000) if wall_duration_ms > 0 else float("nan"),
+            "worker_idx": worker_id if worker_id is not None else "",
+            "exp_num_users": request_records[0].get("exp_num_users", ""),
+            "workload_profile": request_records[0].get("workload_profile", ""),
+            "exclude": request_records[0].get("exclude", ""),
+            "consistent": all(record.get("consistent") is True for record in request_records),
+            "error": next((record.get("error") for record in request_records if record.get("error") not in (None, "", "None")), ""),
+            "response_char_count": len("".join(texts)),
         }
+        if include_text:
+            row["response_text"] = "".join(texts)
+        rows.append(row)
+    success_rate = (
+        sum(1 for row in rows if row["successful_request"]) / len(rows) * 100
+        if rows
+        else 0
+    )
+    for row in rows:
+        row["success_rate"] = success_rate
+    return rows
 
-    # Calculate overall success rate (as percentage)
-    success_rate = (successful_requests / total_requests * 100) if total_requests > 0 else 0
 
-    # Sort the data by received_timestamp
-    sorted_data = sorted(completion_data.values(), key=lambda x: x["received_timestamp"])
-
-    # Generate CSV file
-    with open(output_csv_path, 'w', newline='') as csvfile:
-        fieldnames = ['received_timestamp', 'complete_response_time', 'success_rate', 'success', 'worker_idx', 'request_idx', 'global_request_id']
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        
+def write_csv(rows: list[dict[str, Any]], path: Path) -> None:
+    if not rows:
+        raise ValueError("No request records were found.")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]), extrasaction="ignore")
         writer.writeheader()
-        for data in sorted_data:
-            writer.writerow({
-                'received_timestamp': data['received_timestamp'],
-                'complete_response_time': data['complete_response_time'],
-                'success_rate': success_rate,  # Same for all rows
-                'success': data['success'],  # Individual request success status
-                'worker_idx': data.get('worker_idx'),
-                'request_idx': data.get('request_idx'),
-                'global_request_id': data.get('global_request_id'),
-            })
+        writer.writerows(rows)
 
-    print(f"CSV file generated successfully at: {output_csv_path}")
-    print(f"Total requests: {total_requests}")
-    print(f"Successful requests: {successful_requests}")
-    print(f"Success rate: {success_rate:.2f}%")
 
-    return completion_data
-
-if __name__ == "__main__":
-    results_dir = _resolve_results_dir()
-
-    parser = argparse.ArgumentParser(description="Convert JSON requests data to CSV with completion times and success rate.")
-    parser.add_argument("json_file_path", nargs="?", default=None, help="Path to the input JSON file (default: RESULTS_DIR/results.json)")
-    parser.add_argument("output_csv_path", nargs="?", default=None, help="Path to the output CSV file (default: RESULTS_DIR/output.csv)")
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Convert token-level LLM results to one CSV row per request.")
+    parser.add_argument("input_json", type=Path, nargs="?", default=Path("results.json"))
+    parser.add_argument("output_csv", type=Path, nargs="?", default=None)
+    parser.add_argument("--input-tokens", type=Path, default=None)
+    parser.add_argument("--include-text", action="store_true")
     args = parser.parse_args()
 
-    json_file_path = args.json_file_path if args.json_file_path else str(results_dir / "results.json")
-    output_csv_path = args.output_csv_path if args.output_csv_path else str(results_dir / "output.csv")
+    output = args.output_csv
+    if output is None:
+        output = (
+            args.input_json.with_name("output.csv")
+            if args.input_json.name == "results.json"
+            else args.input_json.with_name(f"{args.input_json.stem}_from_json.csv")
+        )
+    token_path = args.input_tokens or args.input_json.with_name("input_tokens.json")
+    rows = aggregate_requests(load_records(args.input_json), load_input_tokens(token_path), args.include_text)
+    write_csv(rows, output)
+    print(f"Wrote {len(rows):,} request rows to {output}")
 
-    calculate_completion_time_and_success(json_file_path, output_csv_path)
+
+if __name__ == "__main__":
+    main()

@@ -370,6 +370,8 @@ def run(result_filename=None):
             sample_requests = json.load(f)
 
     progress_lock = threading.Lock()
+    input_tokens_lock = threading.Lock()
+    input_tokens_by_request = {}
     scheduled_by_worker = {}
     inflight_by_worker = {}
 
@@ -545,7 +547,8 @@ def run(result_filename=None):
                 with rs_lock:
                     profile = _choose_profile(rs)
                     sample_idx = rs.randint(low=0, high=len(profile["cases"]))
-                template_request = profile["cases"][sample_idx]["request"]
+                selected_case = profile["cases"][sample_idx]
+                template_request = selected_case["request"]
                 request_payload, _ = _build_request_payload(
                     template_request, target, rs, profile["bounds"], active_model
                 )
@@ -553,10 +556,18 @@ def run(result_filename=None):
             else:
                 with rs_lock:
                     sample_idx = rs.randint(low=0, high=len(sample_requests))
-                template_request = sample_requests[sample_idx]["request"]
+                selected_case = sample_requests[sample_idx]
+                template_request = selected_case["request"]
                 request_payload, _ = _build_request_payload(
                     template_request, target, rs, output_token_override, active_model
                 )
+
+            input_token_count = selected_case.get("prompt_token_count")
+            if input_token_count is None:
+                input_token_count = selected_case.get("config", {}).get("in_tokens")
+            if isinstance(input_token_count, (int, float)) and not isinstance(input_token_count, bool):
+                with input_tokens_lock:
+                    input_tokens_by_request[(wid, req_idx)] = int(input_token_count)
 
             if target == "vllm":
                 headers = {"User-Agent": "fmaas-load-test"}
@@ -820,6 +831,22 @@ def run(result_filename=None):
     print(">> writing results to file: %s" % (outfile))
     with open(outfile, "w") as f:
         json.dump(merged_data, f)
+    input_tokens_path = os.path.join(RESULTS_DIR, "input_tokens.json")
+    with open(input_tokens_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "requests": [
+                    {
+                        "worker_idx": worker_idx,
+                        "request_idx": request_idx,
+                        "input_token_count": count,
+                    }
+                    for (worker_idx, request_idx), count in sorted(input_tokens_by_request.items())
+                ]
+            },
+            f,
+        )
+    print(">> writing input token counts to file: %s" % input_tokens_path)
 
     return all_outputs
 

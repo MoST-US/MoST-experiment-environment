@@ -1495,8 +1495,10 @@ def main():
                 print(f"Warning: {csv_name} not found; skipping move.")
         # Keep a copy of results.json in the working directory for downstream readers
         shutil.copyfile("results.json", os.path.join(full_dir_path, "results.json"))
+        if os.path.exists("input_tokens.json"):
+            shutil.copyfile("input_tokens.json", os.path.join(full_dir_path, "input_tokens.json"))
         
-        print("Moved CSV files and copied results.json to the directory")
+        print("Moved CSV files and copied results.json and input_tokens.json when available")
         
     except Exception as e:
         print(f"An error occurred: {e}")

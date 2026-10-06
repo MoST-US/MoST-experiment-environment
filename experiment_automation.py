@@ -700,6 +700,29 @@ def run_command_capture(command):
         print(f"Warning: Command '{command}' returned non-zero exit code: {result.returncode}")
     return result.returncode, result.stdout, result.stderr
 
+def _convert_latest_iteration(parent_dir):
+    """Refresh the archived per-request CSV while the iteration is cooling down."""
+    results_dir = Path(RESULTS_DIR)
+    if not results_dir.is_absolute():
+        results_dir = Path(__file__).resolve().parent / results_dir
+    parent_path = results_dir / str(parent_dir)
+    candidates = [
+        path for path in parent_path.iterdir()
+        if path.is_dir() and (path / RESULTS_FILENAME).is_file()
+    ] if parent_path.is_dir() else []
+    if not candidates:
+        print(f"Warning: no archived iteration found for CSV refresh: {parent_path}")
+        return
+
+    iteration_path = max(candidates, key=lambda path: path.stat().st_mtime_ns)
+    converter = Path(__file__).resolve().parent / "requests" / "convert_to_csv.py"
+    command = (
+        f'"{sys.executable}" -u "{converter}" '
+        f'"{iteration_path / RESULTS_FILENAME}" "{iteration_path / "output.csv"}" '
+        f'--input-tokens "{iteration_path / "input_tokens.json"}"'
+    )
+    run_command(command)
+
 def run_evaluation_pipeline(experiment_type):
     """Run the evaluation pipeline steps 3-7 and return throughput metric."""
     scripts_dir = Path(__file__).resolve().parent / 'requests'
@@ -1362,6 +1385,8 @@ def run_experiment_for_tokens(tokens, initial_req_min=None, workload_mix=None):
             subprocess.run(store_args)
         finally:
             os.chdir(original_dir2)
+
+        _convert_latest_iteration(parent_dir)
         
         if stop_after_persist:
             return persist_return_value
@@ -1561,4 +1586,3 @@ if __name__ == "__main__":
         print(f"Final results: {results}")
     except Exception as exc:
         print(f"Controlled stop: {exc}")
-
