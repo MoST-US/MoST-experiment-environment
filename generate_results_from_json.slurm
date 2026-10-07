@@ -2,6 +2,7 @@
 #SBATCH -t 24:00:00
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
+#SBATCH --nodelist=c10
 #
 # Generate the derived results_from_json.csv of every iteration under RESULTS_DIR that is
 # missing it. This is a CPU/IO-only pass: it needs no GPU and no inference endpoint. Pass
