@@ -70,6 +70,11 @@ The results can be found under `RESULTS_DIR`, under the name `XXX-XXX_YYY-YYY` (
 `fmperf/utils/MergeResultsCsv.py` merges a whole results scope into a single CSV without touching the archive:
 `python fmperf/utils/MergeResultsCsv.py merge --root <results scope> [--experiments a,b,c] [--include-additive] [--output <file>|-]`.
 It walks `<root>/<experiment>/<iteration>/results.csv`, sorts the experiments by name and the iterations chronologically, and writes `IDENTIFIER` (experiment folder, e.g. `1-100_1-100`), `DATE` (first non-empty `Date`/`date`/`Timestamp`/`timestamp`/`created_at` value of the row, else the iteration folder name) followed by the union of the `results.csv` columns (rows stored with an older header keep empty values for the newer columns). Additive (`mix_...`) folders are skipped unless `--include-additive` is passed or they are named explicitly in `--experiments`; with `--output -` the CSV is streamed to stdout and the JSON summary goes to stderr. The MoST API uses this helper for the dashboard's *Merged CSV (single file)* download.
+`requests/generate_results_from_json.py` fills in the derived `results_from_json.csv` (the per-request conversion of `results.json` that the dashboard uploads and the pipeline never persists) for every iteration of an archive that is missing it, recursively under a results root:
+`python requests/generate_results_from_json.py [results root] [--include-text] [--progress-every N] [--dry-run]`.
+Iterations that already have the CSV are skipped, so the pass is idempotent and safe to re-run; a single failing iteration is reported and skipped instead of aborting the run. The results root defaults to `RESULTS_DIR` (environment or `.env`). It runs as a CPU-only Slurm job with `sbatch generate_results_from_json.slurm` (add a results root, e.g. `sbatch generate_results_from_json.slurm results`). Stale files left by an older converter keep their outdated header and are skipped; run `python requests/remove_invalid_results_csv.py <results root>` first to delete them and regenerate.
+
+
 
 Relevant `results.csv` fields:
 - `REQ_MIN`: requests per minute used for the persisted iteration record. When stage 2 stops due to hard limit, this is the largest TRUE value found.
