@@ -13,6 +13,38 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
+CSV_COLUMNS = (
+    "request_idx",
+    "request_sent_at_utc",
+    "first_token_at_utc",
+    "full_response_received_at_utc",
+    "successful_request",
+    "records_in_request",
+    "response_token_count",
+    "input_token_count",
+    "output_token_count",
+    "first_token_ms",
+    "request_duration_ms",
+    "token_generation_duration_sum_ms",
+    "token_generation_duration_avg_ms",
+    "token_generation_duration_min_ms",
+    "token_generation_duration_max_ms",
+    "token_generation_duration_stdev_ms",
+    "token_generation_duration_p95_ms",
+    "inter_token_interval_avg_ms",
+    "inter_token_interval_stdev_ms",
+    "tokens_per_second",
+    "worker_idx",
+    "exp_num_users",
+    "workload_profile",
+    "exclude",
+    "consistent",
+    "error",
+    "response_char_count",
+    "success_rate",
+)
+
+
 def timestamp_to_iso(value: Any) -> str:
     if value is None:
         return ""
@@ -168,7 +200,12 @@ def write_csv(rows: list[dict[str, Any]], path: Path) -> None:
         raise ValueError("No request records were found.")
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=list(rows[0]), extrasaction="ignore")
+        fieldnames = (
+            (*CSV_COLUMNS, "response_text")
+            if "response_text" in rows[0]
+            else CSV_COLUMNS
+        )
+        writer = csv.DictWriter(stream, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 
