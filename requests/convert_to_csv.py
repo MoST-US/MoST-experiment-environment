@@ -115,9 +115,15 @@ def aggregate_requests(
         request_id = record.get("request_idx", f"missing-{position}")
         grouped.setdefault((record.get("worker_idx"), request_id), []).append(record)
 
+    # A list returned by load_records is no longer needed once its records are
+    # indexed. Release that second reference before constructing the output rows.
+    if isinstance(records, list):
+        records.clear()
+
     input_tokens = input_tokens or {}
     rows: list[dict[str, Any]] = []
-    for (worker_id, request_id), request_records in grouped.items():
+    for worker_id, request_id in list(grouped):
+        request_records = grouped.pop((worker_id, request_id))
         timed_records = [
             (float(record["timestamp"]), float(record["duration_ms"]))
             for record in request_records
