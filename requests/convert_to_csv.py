@@ -7,10 +7,18 @@ import argparse
 import csv
 import json
 import math
+import os
 import statistics
+import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
+
+try:
+    import resource
+except ImportError:  # pragma: no cover - resource is not available on Windows
+    resource = None
 
 
 CSV_COLUMNS = (
@@ -43,6 +51,23 @@ CSV_COLUMNS = (
     "response_char_count",
     "success_rate",
 )
+
+
+def _memory_usage_mb() -> float | None:
+    """Return the current process RSS in MiB when the platform exposes it."""
+    if resource is None:
+        return None
+    usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # Linux reports KiB; macOS reports bytes.
+    if sys.platform == "darwin":
+        return usage / (1024 * 1024)
+    return usage / 1024
+
+
+def _progress(message: str) -> None:
+    memory = _memory_usage_mb()
+    suffix = f"; peak RSS={memory:.1f} MiB" if memory is not None else ""
+    print(f"[convert_to_csv] {message}{suffix}", flush=True)
 
 
 def timestamp_to_iso(value: Any) -> str:
@@ -109,11 +134,17 @@ def aggregate_requests(
     records: Iterable[dict[str, Any]],
     input_tokens: dict[tuple[Any, Any], int] | None = None,
     include_text: bool = False,
+    progress_every: int | None = None,
 ) -> list[dict[str, Any]]:
     grouped: dict[tuple[Any, Any], list[dict[str, Any]]] = {}
     for position, record in enumerate(records):
         request_id = record.get("request_idx", f"missing-{position}")
         grouped.setdefault((record.get("worker_idx"), request_id), []).append(record)
+        if progress_every and (position + 1) % progress_every == 0:
+            _progress(
+                f"indexed {position + 1:,} token records into "
+                f"{len(grouped):,} requests"
+            )
 
     # A list returned by load_records is no longer needed once its records are
     # indexed. Release that second reference before constructing the output rows.
@@ -122,7 +153,8 @@ def aggregate_requests(
 
     input_tokens = input_tokens or {}
     rows: list[dict[str, Any]] = []
-    for worker_id, request_id in list(grouped):
+    total_requests = len(grouped)
+    for request_number, (worker_id, request_id) in enumerate(list(grouped), start=1):
         request_records = grouped.pop((worker_id, request_id))
         timed_records = [
             (float(record["timestamp"]), float(record["duration_ms"]))
@@ -198,6 +230,12 @@ def aggregate_requests(
         if include_text:
             row["response_text"] = "".join(response_text_parts or ())
         rows.append(row)
+        if progress_every and (
+            request_number % progress_every == 0 or request_number == total_requests
+        ):
+            _progress(
+                f"aggregated {request_number:,}/{total_requests:,} requests"
+            )
     success_rate = (
         sum(1 for row in rows if row["successful_request"]) / len(rows) * 100
         if rows
@@ -208,7 +246,11 @@ def aggregate_requests(
     return rows
 
 
-def write_csv(rows: list[dict[str, Any]], path: Path) -> None:
+def write_csv(
+    rows: list[dict[str, Any]],
+    path: Path,
+    progress_every: int | None = None,
+) -> None:
     if not rows:
         raise ValueError("No request records were found.")
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -220,7 +262,12 @@ def write_csv(rows: list[dict[str, Any]], path: Path) -> None:
         )
         writer = csv.DictWriter(stream, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(rows)
+        for row_number, row in enumerate(rows, start=1):
+            writer.writerow(row)
+            if progress_every and (
+                row_number % progress_every == 0 or row_number == len(rows)
+            ):
+                _progress(f"wrote {row_number:,}/{len(rows):,} CSV rows")
 
 
 def main() -> None:
@@ -229,7 +276,15 @@ def main() -> None:
     parser.add_argument("output_csv", type=Path, nargs="?", default=None)
     parser.add_argument("--input-tokens", type=Path, default=None)
     parser.add_argument("--include-text", action="store_true")
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=10_000,
+        help="Log progress and peak RSS every N records/requests (0 disables progress logs).",
+    )
     args = parser.parse_args()
+    if args.progress_every < 0:
+        parser.error("--progress-every must be non-negative")
 
     output = args.output_csv
     if output is None:
@@ -239,9 +294,26 @@ def main() -> None:
             else args.input_json.with_name(f"{args.input_json.stem}_from_json.csv")
         )
     token_path = args.input_tokens or args.input_json.with_name("input_tokens.json")
-    rows = aggregate_requests(load_records(args.input_json), load_input_tokens(token_path), args.include_text)
-    write_csv(rows, output)
-    print(f"Wrote {len(rows):,} request rows to {output}")
+    started = time.monotonic()
+    _progress(
+        f"loading {args.input_json} ({args.input_json.stat().st_size / (1024 * 1024):.1f} MiB)"
+    )
+    records = load_records(args.input_json)
+    _progress(f"loaded {len(records):,} token records")
+    input_tokens = load_input_tokens(token_path)
+    _progress(f"loaded {len(input_tokens):,} input-token counts from {token_path}")
+    rows = aggregate_requests(
+        records,
+        input_tokens,
+        args.include_text,
+        args.progress_every or None,
+    )
+    _progress(f"writing {len(rows):,} rows to {output}")
+    write_csv(rows, output, args.progress_every or None)
+    _progress(
+        f"finished in {time.monotonic() - started:.1f}s; wrote {len(rows):,} "
+        f"request rows to {output}"
+    )
 
 
 if __name__ == "__main__":
