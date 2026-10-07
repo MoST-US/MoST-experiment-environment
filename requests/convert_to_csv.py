@@ -270,10 +270,112 @@ def write_csv(
                 _progress(f"wrote {row_number:,}/{len(rows):,} CSV rows")
 
 
+def convert_one(
+    input_json: Path,
+    output_csv: Path,
+    token_path: Path,
+    include_text: bool,
+    progress_every: int | None,
+) -> int:
+    """Convert a single results.json into its per-request CSV; return the number of rows written."""
+    started = time.monotonic()
+    _progress(
+        f"loading {input_json} ({input_json.stat().st_size / (1024 * 1024):.1f} MiB)"
+    )
+    records = load_records(input_json)
+    _progress(f"loaded {len(records):,} token records")
+    input_tokens = load_input_tokens(token_path)
+    _progress(f"loaded {len(input_tokens):,} input-token counts from {token_path}")
+    rows = aggregate_requests(
+        records,
+        input_tokens,
+        include_text,
+        progress_every,
+    )
+    _progress(f"writing {len(rows):,} rows to {output_csv}")
+    write_csv(rows, output_csv, progress_every)
+    _progress(
+        f"finished in {time.monotonic() - started:.1f}s; wrote {len(rows):,} "
+        f"request rows to {output_csv}"
+    )
+    return len(rows)
+
+
+def run_batch(experiment_dir: Path, include_text: bool, progress_every: int | None) -> int:
+    """Convert every iteration of one experiment folder in this single interpreter.
+
+    The dashboard uploads the derived ``results_from_json.csv`` of every iteration, which the
+    experiment pipeline never persists, so it has to be generated on demand. Spawning one
+    interpreter per iteration made a large sweep pay hundreds of startups and results.json
+    loads interleaved with the GitHub upload; doing the whole folder in one pass keeps the
+    per-iteration cost to the parse itself (memory is released per iteration by
+    ``aggregate_requests``) and lets the caller stream the prepared CSVs as plain cache hits.
+
+    Returns a process exit code (0 when the pass ran, even if individual iterations failed).
+    """
+    if not experiment_dir.is_dir():
+        print(
+            f"[convert_to_csv] batch: {experiment_dir} is not a directory",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 2
+
+    converted = 0
+    skipped = 0
+    failed = 0
+    iteration_dirs = sorted(
+        (
+            entry
+            for entry in experiment_dir.iterdir()
+            if entry.is_dir() and not entry.name.startswith(".")
+        ),
+        key=lambda entry: entry.name,
+    )
+
+    for iteration_dir in iteration_dirs:
+        input_json = iteration_dir / "results.json"
+        output_csv = iteration_dir / "results_from_json.csv"
+        if not input_json.exists():
+            continue
+        if output_csv.exists():
+            skipped += 1
+            _progress(f"batch: {iteration_dir.name}: skipped (already converted)")
+            continue
+        try:
+            rows = convert_one(
+                input_json,
+                output_csv,
+                iteration_dir / "input_tokens.json",
+                include_text,
+                progress_every,
+            )
+        except Exception as error:  # noqa: BLE001 - one bad iteration must not stop the batch
+            failed += 1
+            print(
+                f"[convert_to_csv] batch: {iteration_dir.name}: failed: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
+            continue
+        converted += 1
+        _progress(f"batch: {iteration_dir.name}: converted {rows:,} rows")
+
+    _progress(f"batch summary: converted={converted} skipped={skipped} failed={failed}")
+    return 0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Convert token-level LLM results to one CSV row per request.")
     parser.add_argument("input_json", type=Path, nargs="?", default=Path("results.json"))
     parser.add_argument("output_csv", type=Path, nargs="?", default=None)
+    parser.add_argument(
+        "--batch-dir",
+        type=Path,
+        default=None,
+        help="Convert every iteration of this experiment folder in one pass (filling in the "
+        "results_from_json.csv each iteration is missing) instead of a single input file.",
+    )
     parser.add_argument("--input-tokens", type=Path, default=None)
     parser.add_argument("--include-text", action="store_true")
     parser.add_argument(
@@ -286,6 +388,9 @@ def main() -> None:
     if args.progress_every < 0:
         parser.error("--progress-every must be non-negative")
 
+    if args.batch_dir is not None:
+        raise SystemExit(run_batch(args.batch_dir, args.include_text, args.progress_every or None))
+
     output = args.output_csv
     if output is None:
         output = (
@@ -294,26 +399,7 @@ def main() -> None:
             else args.input_json.with_name(f"{args.input_json.stem}_from_json.csv")
         )
     token_path = args.input_tokens or args.input_json.with_name("input_tokens.json")
-    started = time.monotonic()
-    _progress(
-        f"loading {args.input_json} ({args.input_json.stat().st_size / (1024 * 1024):.1f} MiB)"
-    )
-    records = load_records(args.input_json)
-    _progress(f"loaded {len(records):,} token records")
-    input_tokens = load_input_tokens(token_path)
-    _progress(f"loaded {len(input_tokens):,} input-token counts from {token_path}")
-    rows = aggregate_requests(
-        records,
-        input_tokens,
-        args.include_text,
-        args.progress_every or None,
-    )
-    _progress(f"writing {len(rows):,} rows to {output}")
-    write_csv(rows, output, args.progress_every or None)
-    _progress(
-        f"finished in {time.monotonic() - started:.1f}s; wrote {len(rows):,} "
-        f"request rows to {output}"
-    )
+    convert_one(args.input_json, output, token_path, args.include_text, args.progress_every or None)
 
 
 if __name__ == "__main__":
