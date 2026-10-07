@@ -38,7 +38,7 @@ and differ only in how an iteration's verdict is computed.
 `requests/evaluate.py` compares the two `FILTER_BUFFER`-trimmed halves of the iteration:
 
 1. success-rate gate: any `success_rate < SUCCESS_RATE_THRESHOLD` in either half → FALSE (exit 1);
-2. otherwise Welch t-test (alpha 0.1) on `complete_response_time`, plus Cohen's d, a 10 000-sample
+2. otherwise Welch t-test (alpha 0.1) on `request_duration_ms`, plus Cohen's d, a 10 000-sample
    bootstrap CI and a TOST with `EQUIV_MARGIN = 0.02`;
 3. TRUE (exit 0) when there is no statistical difference **or** the first half has the higher
    response time (i.e. the second half is not degrading).

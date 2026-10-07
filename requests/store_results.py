@@ -1020,6 +1020,15 @@ def _parse_timestamp_string(value: str | None) -> datetime | None:
     s = value.strip()
     if not s:
         return None
+    # ISO-8601 first: convert_to_csv.py writes "2026-10-07T12:34:56.789000+00:00"
+    # and split_results.py re-writes the parsed value with a space separator
+    # ("2026-10-07 12:34:56.789000+00:00"); both carry a numeric offset (or a 'Z').
+    iso_candidate = s[:-1] + "+00:00" if s.endswith("Z") else s
+    for candidate in (iso_candidate, s):
+        try:
+            return datetime.fromisoformat(candidate)
+        except ValueError:
+            continue
     for fmt in _TIMESTAMP_FORMATS:
         try:
             return datetime.strptime(s, fmt)
@@ -1034,13 +1043,27 @@ def _extract_timestamp_from_csv(path: Path) -> tuple[datetime | None, str | None
     try:
         with path.open("r", encoding="utf-8", newline="") as file:
             reader = csv.reader(file)
-            next(reader, None)  # header
+            header = next(reader, None)
             row = next(reader, None)
     except Exception:
         return None, None
-    if not row:
+    if not header or not row:
         return None, None
-    raw_value = row[0] if row else None
+    # Resolve the completion timestamp by header name (convert_to_csv.py writes
+    # `full_response_received_at_utc`); fall back to the legacy first column.
+    column_name = next(
+        (
+            name
+            for name in ("full_response_received_at_utc", "received_timestamp")
+            if name in header
+        ),
+        None,
+    )
+    if column_name is not None:
+        index = header.index(column_name)
+        raw_value = row[index] if index < len(row) else None
+    else:
+        raw_value = row[0]
     return _parse_timestamp_string(raw_value), raw_value
 
 

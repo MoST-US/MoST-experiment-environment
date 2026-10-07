@@ -33,19 +33,49 @@ if not RESULTS_PATH.is_absolute():
     RESULTS_PATH = Path(ROOT_DIR) / RESULTS_PATH
 RESULTS_PATH.mkdir(parents=True, exist_ok=True)
 
+# Per-request columns written by requests/convert_to_csv.py (see CSV_COLUMNS there).
+# These replaced the legacy `received_timestamp` / `complete_response_time` names.
+TIMESTAMP_COLUMN = 'full_response_received_at_utc'
+DURATION_COLUMN = 'request_duration_ms'
+
+
+def _load_timestamp_column(df):
+    """Return ``df`` plus the name of its parsed, tz-aware timestamp column.
+
+    convert_to_csv.py writes ``full_response_received_at_utc`` as an ISO-8601 string
+    (e.g. "2026-10-07T12:34:56.789000+00:00"). Legacy files used
+    ``received_timestamp`` in the "%Y%m%dT%H%M%S" form, so both spellings are accepted.
+    """
+    if TIMESTAMP_COLUMN in df.columns:
+        df[TIMESTAMP_COLUMN] = pd.to_datetime(
+            df[TIMESTAMP_COLUMN], errors='coerce', utc=True
+        )
+        return df, TIMESTAMP_COLUMN
+    if 'received_timestamp' in df.columns:
+        # Legacy CSVs stored the compact "%Y%m%dT%H%M%S" form.
+        df['received_timestamp'] = pd.to_datetime(
+            df['received_timestamp'], format='%Y%m%dT%H%M%S', errors='coerce', utc=True
+        )
+        return df, 'received_timestamp'
+    raise KeyError(
+        f"Missing timestamp column '{TIMESTAMP_COLUMN}'. The CSV must come from "
+        "requests/convert_to_csv.py"
+    )
+
+
 def process_experiment_data(input_file):
     # Read the CSV file
     df = pd.read_csv(input_file)
     
     # Convert timestamp to datetime
-    df['received_timestamp'] = pd.to_datetime(df['received_timestamp'], format='%Y%m%dT%H%M%S')
+    df, ts_col = _load_timestamp_column(df)
     
     # Sort by timestamp to ensure chronological order
-    df = df.sort_values('received_timestamp').reset_index(drop=True)
+    df = df.sort_values(ts_col).reset_index(drop=True)
     
     # Calculate total experiment duration
-    start_time = df['received_timestamp'].min()
-    end_time = df['received_timestamp'].max()
+    start_time = df[ts_col].min()
+    end_time = df[ts_col].max()
     total_duration = end_time - start_time
     
     print(f"Experiment started at: {start_time}")
@@ -57,8 +87,8 @@ def process_experiment_data(input_file):
     filtered_end = end_time - timedelta(seconds=BUFFER_SECONDS)
     
     filtered_df = df[
-        (df['received_timestamp'] >= filtered_start) & 
-        (df['received_timestamp'] <= filtered_end)
+        (df[ts_col] >= filtered_start) & 
+        (df[ts_col] <= filtered_end)
     ].copy().reset_index(drop=True)
     
     print(f"\nAfter removing first and last {BUFFER_SECONDS} minutes:")
@@ -72,11 +102,11 @@ def process_experiment_data(input_file):
     split_time = filtered_start + (filtered_duration / 2)
     
     first_half = filtered_df[
-        filtered_df['received_timestamp'] < split_time
+        filtered_df[ts_col] < split_time
     ].copy().reset_index(drop=True)
     
     second_half = filtered_df[
-        filtered_df['received_timestamp'] >= split_time
+        filtered_df[ts_col] >= split_time
     ].copy().reset_index(drop=True)
     
     print(f"\nSplit midpoint: {split_time}")
@@ -95,16 +125,33 @@ def process_experiment_data(input_file):
     
     return first_half, second_half
 
-# Process the data
-first_period, second_period = process_experiment_data(RESULTS_PATH / 'output.csv')
+def _resolve_duration_column(df):
+    if DURATION_COLUMN in df.columns:
+        return DURATION_COLUMN
+    if 'complete_response_time' in df.columns:
+        return 'complete_response_time'
+    return None
 
-# Display some statistics
-print(f"\nFirst period statistics:")
-print(f"Response time - Min: {first_period['complete_response_time'].min():.2f}, "
-      f"Max: {first_period['complete_response_time'].max():.2f}, "
-      f"Mean: {first_period['complete_response_time'].mean():.2f}")
 
-print(f"Second period statistics:")
-print(f"Response time - Min: {second_period['complete_response_time'].min():.2f}, "
-      f"Max: {second_period['complete_response_time'].max():.2f}, "
-      f"Mean: {second_period['complete_response_time'].mean():.2f}")
+def _print_period_stats(label, period):
+    column = _resolve_duration_column(period)
+    if column is None:
+        print(f"\n{label}: response-time column not found; skipping statistics")
+        return
+    print(f"\n{label}:")
+    print(f"Response time - Min: {period[column].min():.2f}, "
+          f"Max: {period[column].max():.2f}, "
+          f"Mean: {period[column].mean():.2f}")
+
+
+def main():
+    # Process the data
+    first_period, second_period = process_experiment_data(RESULTS_PATH / 'output.csv')
+
+    # Display some statistics
+    _print_period_stats("First period statistics", first_period)
+    _print_period_stats("Second period statistics", second_period)
+
+
+if __name__ == '__main__':
+    main()

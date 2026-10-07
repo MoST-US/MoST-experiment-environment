@@ -36,6 +36,13 @@ if not RESULTS_PATH.is_absolute():
 
 SUCCESS_RATE_THRESHOLD = float(os.environ.get('SUCCESS_RATE_THRESHOLD', '95.0'))
 
+# Per-request columns written by requests/convert_to_csv.py (see its CSV_COLUMNS).
+# These replaced the legacy `complete_response_time` / `received_timestamp` names;
+# split_results.py still accepts legacy CSVs, and the contract test in
+# fmperf/tests/test_output_csv_contract.py guards this agreement.
+METRICS = ["request_duration_ms"]
+TIMESTAMP_COLUMN = "full_response_received_at_utc"
+
 # Function definitions
 def welch_ttest(x: np.ndarray, y: np.ndarray):
     """Test t de Welch con gestión de NaN."""
@@ -80,8 +87,8 @@ if __name__ == "__main__":
     n_boot = 10000
     equiv = True
     EQUIV_MARGIN = 0.02
-    metrics = ["complete_response_time"]
-    timestamp_column = "received_timestamp"
+    metrics = METRICS
+    timestamp_column = TIMESTAMP_COLUMN
     
     # Define the column name for the statistical difference flag
     STAT_DIFF_COL = "no_statistical_difference_overall"

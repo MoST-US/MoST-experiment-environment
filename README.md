@@ -88,6 +88,12 @@ Relevant `results.csv` fields:
 
 Additive `WORKLOAD_MIXES` experiments follow the same stages: every mix is an experiment of its own (identified by `WORKLOAD_MIX`), `REQ_MIN_START` is taken per mix, and the thresholds and verdicts are unchanged. The only difference is the workload, because each request is routed to one of the profiles of the mix instead of belonging to a single token interval.
 
+Relevant `output.csv` fields (one row per request, written by [requests/convert_to_csv.py](requests/convert_to_csv.py)):
+- `full_response_received_at_utc`: ISO-8601 completion timestamp (UTC offset included); [requests/split_results.py](requests/split_results.py) trims and splits on it and [requests/store_results.py](requests/store_results.py) derives the iteration folder name from the earliest value. The deprecated column name was `received_timestamp`.
+- `request_duration_ms`: end-to-end request duration in milliseconds; the metric compared by [requests/evaluate.py](requests/evaluate.py). The deprecated column name was `complete_response_time`.
+- `successful_request` / `success_rate`: per-request success flag and the per-iteration success ratio; `evaluate.py` gates on `success_rate < SUCCESS_RATE_THRESHOLD`. The deprecated flag name was `success`.
+- The producer/consumer agreement is pinned by [fmperf/tests/test_output_csv_contract.py](fmperf/tests/test_output_csv_contract.py).
+
 # How it works
 
 The experiment consists of a set of iterations. During an iteration, of a specified duration, a number of requests will be sent per minute. The number of requests depends on the value of REQ_MIN. 

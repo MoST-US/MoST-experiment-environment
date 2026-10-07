@@ -62,14 +62,14 @@ results/                                                      # RESULTS_DIR from
         └── <YYYY-MM-DD_HH-MM-SS>/                            # one folder per iteration
             ├── results.csv        # the published per-iteration summary (see 02/06)
             ├── results.json       # raw per-token events (fmperf loadgen output, copied)
-            ├── output.csv         # one row per request (response time, success, success_rate)
+            ├── output.csv         # one row per request (`full_response_received_at_utc`, `request_duration_ms`, `successful_request`, `success_rate`)
             ├── first_half.csv / second_half.csv   # FILTER_BUFFER-trimmed halves
             └── prompts.csv        # unique prompts + token counts + occurrences
 ```
 
 - The archive folder is created only at the end of the whole automation run, and it is named with
   the timestamp of that moment; the iteration folder name comes from the first response timestamp
-  inside the CSVs (earliest `received_timestamp`). Additive (`WORKLOAD_MIXES`) executions use
+  inside the CSVs (earliest `full_response_received_at_utc`). Additive (`WORKLOAD_MIXES`) executions use
   `Experiment_MIX_<EXPERIMENT_TYPE>_<timestamp>` as the prefix.
 - Additive rows identify their experiment with `WORKLOAD_MIX` and keep the four
   `MIN/MAX_INPUT/OUTPUT_TOKENS` columns empty on purpose (see 02/03); their parent folder is the

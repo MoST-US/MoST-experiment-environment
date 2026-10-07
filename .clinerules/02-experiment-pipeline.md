@@ -6,7 +6,7 @@
 | --- | --- | --- | --- |
 | 1 | load generation + measurement | `python -u -m fmperf.loadgen.run` (writes `RESULTS_DIR/results.json`; routes every request to a mix profile and tags it with `workload_profile` when `ADDITIVE=TRUE`) | repo root |
 | 2 | `cd` | `os.makedirs(RESULTS_DIR)` + `os.chdir(RESULTS_DIR)` | `RESULTS_DIR` |
-| 3 | convert | `python -u requests/convert_to_csv.py` → `output.csv` (per request: completion time, success, success_rate) | `RESULTS_DIR` |
+| 3 | convert | `python -u requests/convert_to_csv.py` → `output.csv` (per request: `full_response_received_at_utc`, `request_duration_ms`, `successful_request`, `success_rate`; see the `output.csv` contract below) | `RESULTS_DIR` |
 | 4 | early metrics gate | `python -u requests/analyze_metrics.py .`; the automation scrapes `Median responded requests per minute:` and, for non-MIT runs, fails the iteration when it is `< 0.95 * REQ_MIN` | `RESULTS_DIR` |
 | 5 | split | `python -u requests/split_results.py` → trims `FILTER_BUFFER` seconds from both ends and writes `first_half.csv` / `second_half.csv` | `RESULTS_DIR` |
 | 6 | evaluate | `python -u requests/evaluate.py` (MST only; skipped for MIT). Exit code 0 = TRUE, non-zero = FALSE | `RESULTS_DIR` |
@@ -135,6 +135,27 @@ Fragilities to respect:
   again; never rely on heuristics for new modes, and prefer explicit named arguments when refactoring.
 - When refactoring, keep the legacy branch working or delete it deliberately: the MoST API/dashboard
   and older Slurm logs may still produce the legacy order.
+
+## `output.csv` contract
+
+- `requests/convert_to_csv.py` is the **only** producer of `output.csv`. Its `CSV_COLUMNS` is the
+  contract; consumers must read columns **by name**, never by position.
+- The columns the pipeline depends on:
+  - `full_response_received_at_utc` (ISO-8601, UTC offset) — `requests/split_results.py` sorts,
+    trims and splits on it; `requests/store_results.py::_derive_directory_name` reads the earliest
+    value to name the iteration folder. Deprecated name: `received_timestamp`.
+  - `request_duration_ms` — the metric compared by `requests/evaluate.py`. Deprecated name:
+    `complete_response_time`.
+  - `successful_request` / `success_rate` — the per-request flag and the per-iteration ratio;
+    `requests/evaluate.py` gates on `success_rate < SUCCESS_RATE_THRESHOLD`. Deprecated flag name:
+    `success`.
+- Never read `row[0]` of `output.csv`/`first_half.csv`: it is `request_idx` (an integer), not a
+  timestamp; doing so silently produced `0` as the iteration folder name.
+- `requests/split_results.py` and `requests/store_results.py` still accept the legacy names so old
+  archives keep working, but the producer always writes the names above, and `requests/evaluate.py`
+  reads them through its module-level `METRICS` / `TIMESTAMP_COLUMN` constants.
+- `fmperf/tests/test_output_csv_contract.py` runs `results.json → convert_to_csv → split_results →
+  store_results` on a synthetic fixture and fails if producer and consumers drift apart.
 
 ## `results.csv` contract
 

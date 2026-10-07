@@ -31,6 +31,10 @@ directory.
 2. Library import check: `python -c "import fmperf"` (requires `.env`).
 3. Unit tests: `pytest fmperf/tests/` (equivalently `make test`).
    `fmperf/loadgen/test_collect_energy.py` covers the energy helpers via `unittest.mock`.
+   `fmperf/tests/test_output_csv_contract.py` pins the `output.csv` column contract between
+   `requests/convert_to_csv.py` and its consumers (`split_results.py`, `evaluate.py`,
+   `store_results.py`); it runs standalone with `python fmperf/tests/test_output_csv_contract.py`
+   when `pytest` is unavailable.
 4. Sandbox the per-iteration scripts. Point `RESULTS_DIR` at a scratch directory outside the repo
    (for example `$env:TEMP\most_sandbox`) and place synthetic `output.csv`, `first_half.csv`,
    `second_half.csv` and `results.json` there, then run e.g.
