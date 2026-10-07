@@ -143,11 +143,18 @@ def aggregate_requests(
             else None
         )
         token_counts = number(record.get("n_tokens") for record in request_records)
-        texts = [
-            record.get("response", {}).get("text", "")
-            for record in request_records
-            if isinstance(record.get("response"), dict)
-        ]
+        response_char_count = 0
+        response_text_parts: list[str] | None = [] if include_text else None
+        for record in request_records:
+            response = record.get("response")
+            if not isinstance(response, dict):
+                continue
+            text = response.get("text", "")
+            if not isinstance(text, str):
+                continue
+            response_char_count += len(text)
+            if response_text_parts is not None:
+                response_text_parts.append(text)
         ok_values = [record.get("ok") for record in request_records]
         generation_intervals = [
             timestamps[index] - timestamps[index - 1] for index in range(1, len(timestamps))
@@ -180,10 +187,10 @@ def aggregate_requests(
             "exclude": request_records[0].get("exclude", ""),
             "consistent": all(record.get("consistent") is True for record in request_records),
             "error": next((record.get("error") for record in request_records if record.get("error") not in (None, "", "None")), ""),
-            "response_char_count": len("".join(texts)),
+            "response_char_count": response_char_count,
         }
         if include_text:
-            row["response_text"] = "".join(texts)
+            row["response_text"] = "".join(response_text_parts or ())
         rows.append(row)
     success_rate = (
         sum(1 for row in rows if row["successful_request"]) / len(rows) * 100
